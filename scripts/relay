@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# relay — control the DashLLM relay systemd *user* service from anywhere.
+#
+#   relay start | stop | restart | status | logs | enable | disable
+#
+# Install (user-wide, on PATH):
+#   install -m755 scripts/relay ~/.local/bin/relay
+# or system-wide (all users, needs sudo):
+#   sudo install -m755 scripts/relay /usr/local/bin/relay
+set -euo pipefail
+
+UNIT=relay.service
+PORT=4000
+
+usage() {
+  cat <<EOF
+relay — control the DashLLM relay service
+
+  relay start      start the relay
+  relay stop       stop the relay
+  relay restart    restart the relay (e.g. after a code change)
+  relay status     show service status + health
+  relay logs       follow the logs (Ctrl-C to quit)
+  relay enable     start on boot (enable + linger)
+  relay disable    don't start on boot
+EOF
+}
+
+case "${1:-status}" in
+  start)   systemctl --user start   "$UNIT" && echo "relay started" ;;
+  stop)    systemctl --user stop    "$UNIT" && echo "relay stopped" ;;
+  restart) systemctl --user restart "$UNIT" && echo "relay restarted" ;;
+  status)
+    systemctl --user --no-pager status "$UNIT" || true
+    echo
+    if curl -fsS --max-time 2 "http://127.0.0.1:${PORT}/health" 2>/dev/null; then
+      echo   # health JSON printed above
+    else
+      echo "health: unreachable on :${PORT}"
+    fi
+    ;;
+  logs)    journalctl --user -u "$UNIT" -f ;;
+  enable)
+    loginctl enable-linger "$USER" 2>/dev/null || true
+    systemctl --user enable --now "$UNIT" && echo "relay enabled on boot"
+    ;;
+  disable) systemctl --user disable --now "$UNIT" && echo "relay disabled on boot" ;;
+  -h|--help|help) usage ;;
+  *) echo "unknown command: $1" >&2; echo; usage; exit 2 ;;
+esac
