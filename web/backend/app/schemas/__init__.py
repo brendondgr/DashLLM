@@ -1,0 +1,171 @@
+"""Pydantic models shared by routes and services (the API contract)."""
+
+from typing import Literal
+
+from pydantic import BaseModel, Field
+
+EndpointKind = Literal["local", "remote_direct", "remote_tunnel"]
+ServerType = Literal["llama.cpp", "vLLM", "ollama", "openai"]
+Health = Literal["healthy", "degraded", "failed", "unknown"]
+RouterPolicy = Literal["manual", "priority"]
+
+
+# ---- endpoints -------------------------------------------------------
+class EndpointCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    base_url: str = Field(min_length=1)
+    kind: EndpointKind | None = None  # inferred from URL when omitted
+    server_type: ServerType = "openai"
+    upstream_key: str | None = None
+    tunnel_id: str | None = None
+    priority: int = 100
+    weight: int = 1
+    enabled: bool = True
+
+
+class EndpointPatch(BaseModel):
+    name: str | None = None
+    base_url: str | None = None
+    kind: EndpointKind | None = None
+    server_type: ServerType | None = None
+    upstream_key: str | None = None
+    tunnel_id: str | None = None
+    priority: int | None = None
+    weight: int | None = None
+    enabled: bool | None = None
+
+
+class EndpointOut(BaseModel):
+    id: str
+    name: str
+    kind: EndpointKind
+    server_type: ServerType
+    base_url: str
+    has_key: bool
+    tunnel_id: str | None
+    priority: int
+    weight: int
+    enabled: bool
+    model: str | None = None
+    health: Health = "unknown"
+    ewma_latency_ms: float | None = None
+    last_ok_ts: float | None = None
+    consecutive_fails: int = 0
+    active: bool = False
+    share: float = 0.0
+
+
+class EndpointTestResult(BaseModel):
+    ok: bool
+    latency_ms: float | None = None
+    models: list[str] = []
+    error: str | None = None
+
+
+class RouterState(BaseModel):
+    policy: RouterPolicy
+    pinned_id: str | None
+    resolved_id: str | None
+    resolved_name: str | None
+
+
+class RouterUpdate(BaseModel):
+    policy: RouterPolicy | None = None
+    pinned_id: str | None = None
+
+
+# ---- tunnels ---------------------------------------------------------
+class TunnelCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    ssh_host: str
+    ssh_port: int = 22
+    ssh_user: str
+    key_path: str | None = None
+    remote_host: str = "127.0.0.1"
+    remote_port: int
+    local_port: int
+    compress: bool = True
+    keepalive: bool = True
+    extra_opts: str | None = None
+    enabled: bool = False
+
+
+class TunnelPatch(BaseModel):
+    name: str | None = None
+    ssh_host: str | None = None
+    ssh_port: int | None = None
+    ssh_user: str | None = None
+    key_path: str | None = None
+    remote_host: str | None = None
+    remote_port: int | None = None
+    local_port: int | None = None
+    compress: bool | None = None
+    keepalive: bool | None = None
+    extra_opts: str | None = None
+    enabled: bool | None = None
+
+
+class TunnelOut(BaseModel):
+    id: str
+    name: str
+    ssh_host: str
+    ssh_port: int
+    ssh_user: str
+    key_path: str | None
+    remote_host: str
+    remote_port: int
+    local_port: int
+    compress: bool
+    keepalive: bool
+    extra_opts: str | None
+    enabled: bool
+    status: Literal["stopped", "starting", "up", "error"] = "stopped"
+    pid: int | None = None
+    last_error: str | None = None
+    started_at: float | None = None
+    uptime_s: float = 0.0
+
+
+class TunnelTestResult(BaseModel):
+    ssh_ok: bool
+    ssh_latency_ms: float | None = None
+    endpoint_ok: bool = False
+    endpoint_latency_ms: float | None = None
+    models: list[str] = []
+    error: str | None = None
+
+
+# ---- runtime settings ------------------------------------------------
+class RuntimeSettings(BaseModel):
+    stream_passthrough: bool = True
+    queue_requests: bool = True
+    auto_failover: bool = True
+    log_bodies: bool = False
+    allow_cors: bool = True
+    inject_stream_usage: bool = True
+    proxy_port: int = 4000
+    retention_days: int = 30
+    restart_required: bool = False
+
+
+class SettingsPatch(BaseModel):
+    stream_passthrough: bool | None = None
+    queue_requests: bool | None = None
+    auto_failover: bool | None = None
+    log_bodies: bool | None = None
+    allow_cors: bool | None = None
+    inject_stream_usage: bool | None = None
+    proxy_port: int | None = None
+    retention_days: int | None = None
+
+
+# ---- frontend log ingestion -------------------------------------------
+class FrontendLogEvent(BaseModel):
+    ts: float | None = None
+    level: Literal["debug", "info", "warn", "error"] = "info"
+    event: str = Field(min_length=1, max_length=200)
+    detail: str | None = Field(default=None, max_length=4000)
+
+
+class FrontendLogBatch(BaseModel):
+    events: list[FrontendLogEvent] = Field(max_length=200)
