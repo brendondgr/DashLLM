@@ -164,21 +164,39 @@ class ProxyService:
                 body_json.get("messages") or body_json.get("prompt") or ""
             )[:_BODY_LIMIT]
 
-        # Concurrency gate: queue (default) or reject with 429.
-        if self._slots.locked() and not settings.queue_requests:
-            log.warning("rejecting request; concurrency limit",
-                        extra={"data": {"id": req_id, "route": route}})
-            return _upstream_error(429, "concurrency limit reached")
-
         # "auto" (the advertised default) is rewritten per resolved endpoint
         # at forward time — upstreams don't know a model called "auto".
         rewrite_auto = requested_model == "auto" and body_json is not None
 
-        async with self._slots:
-            return await self._dispatch(
-                request, path, record, body_bytes, t0,
-                force_endpoint=alias_endpoint,
-                body_json=body_json if rewrite_auto else None)
+        # Count the request as in-flight the moment it is accepted — before it
+        # waits on a concurrency slot or on the upstream to start answering — so
+        # the live concurrency reflects everything moving through the proxy
+        # right now, not only requests the model server has already replied to.
+        self.live.start(req_id, {
+            "ts": started_ts, "model": record.model, "route": route,
+            "stream": want_stream, "client_key": client_key,
+            "endpoint_name": None, "temperature": record.temperature,
+            "max_tokens": record.max_tokens})
+        stream_owns_finish = False
+        try:
+            # Concurrency gate: queue (default) or reject with 429.
+            if self._slots.locked() and not settings.queue_requests:
+                log.warning("rejecting request; concurrency limit",
+                            extra={"data": {"id": req_id, "route": route}})
+                return _upstream_error(429, "concurrency limit reached")
+            async with self._slots:
+                response = await self._dispatch(
+                    request, path, record, body_bytes, t0,
+                    force_endpoint=alias_endpoint,
+                    body_json=body_json if rewrite_auto else None)
+            # A streaming response stays in-flight until its stream ends; the
+            # tee generator calls live.finish() itself. Everything else (a
+            # buffered body or an error response) is done now.
+            stream_owns_finish = isinstance(response, StreamingResponse)
+            return response
+        finally:
+            if not stream_owns_finish:
+                self.live.finish(req_id)
 
     def _parse_json(self, body: bytes) -> dict | None:
         if not body:
@@ -311,6 +329,10 @@ class ProxyService:
             "id": record.id, "route": record.route, "method": request.method,
             "endpoint": endpoint["name"], "model": record.model,
             "stream": record.stream}})
+        # Now that an endpoint is chosen (post-alias/failover), reflect it on
+        # the in-flight row so the live Requests view shows where it's going.
+        self.live.update(record.id, {
+            "endpoint_name": endpoint["name"], "model": record.model})
 
         try:
             resp = await self.http.send(upstream_req, stream=True)
@@ -332,15 +354,11 @@ class ProxyService:
     # ---- non-streaming --------------------------------------------------
     async def _buffered_response(self, resp: httpx.Response, endpoint: dict,
                                  record: RequestRecord, t0: float) -> Response:
-        self.live.start(record.id, {
-            "ts": record.ts, "model": record.model,
-            "endpoint_name": endpoint["name"], "route": record.route,
-            "stream": False, "client_key": record.client_key})
+        # In-flight tracking is owned by handle(); this path just reads + closes.
         try:
             content = await resp.aread()
         finally:
             await resp.aclose()
-            self.live.finish(record.id)
 
         record.status = resp.status_code
         record.ok = resp.status_code < 400
@@ -380,11 +398,7 @@ class ProxyService:
     # ---- streaming (SSE tee) ---------------------------------------------
     def _stream_response(self, resp: httpx.Response, endpoint: dict,
                          record: RequestRecord, t0: float) -> StreamingResponse:
-        self.live.start(record.id, {
-            "ts": record.ts, "model": record.model,
-            "endpoint_name": endpoint["name"], "route": record.route,
-            "stream": True, "client_key": record.client_key})
-
+        # in-flight tracking began in handle(); the tee below owns live.finish().
         keep_bodies = self.settings.current.log_bodies
 
         async def tee():

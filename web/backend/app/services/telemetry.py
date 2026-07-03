@@ -180,6 +180,13 @@ class LiveTracker:
             self.clients[key] = time.time()
         self._sample()
 
+    def update(self, req_id: str, info: dict) -> None:
+        """Fill in fields that are only known after the request is under way
+        (e.g. the resolved endpoint once failover/aliasing has picked one)."""
+        row = self.in_flight.get(req_id)
+        if row is not None:
+            row.update(info)
+
     def bump(self, req_id: str, completion_tokens: int) -> None:
         row = self.in_flight.get(req_id)
         if row is not None:
