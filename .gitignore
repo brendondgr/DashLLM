@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+*.egg-info/
+
+# Node / Astro
+node_modules/
+web/frontend/dist/
+web/frontend/.astro/
+
+# Runtime state (never commit data or logs)
+web/backend/data/
+web/backend/logs/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Env / editor
+.env
+.env.*
+!.env.example
+.DS_Store
