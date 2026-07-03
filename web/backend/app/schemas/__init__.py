@@ -19,6 +19,9 @@ class EndpointCreate(BaseModel):
     server_type: ServerType = "openai"
     upstream_key: str | None = None
     tunnel_id: str | None = None
+    # Interactive SSH tunnel: a raw `ssh -N -L ...` command run on demand.
+    tunnel_command: str | None = None
+    tunnel_local_port: int | None = None
     priority: int = 100
     weight: int = 1
     enabled: bool = True
@@ -33,6 +36,8 @@ class EndpointPatch(BaseModel):
     server_type: ServerType | None = None
     upstream_key: str | None = None
     tunnel_id: str | None = None
+    tunnel_command: str | None = None
+    tunnel_local_port: int | None = None
     priority: int | None = None
     weight: int | None = None
     enabled: bool | None = None
@@ -48,6 +53,8 @@ class EndpointOut(BaseModel):
     base_url: str
     has_key: bool
     tunnel_id: str | None
+    tunnel_command: str | None = None
+    tunnel_local_port: int | None = None
     priority: int
     weight: int
     enabled: bool
@@ -139,6 +146,27 @@ class TunnelTestResult(BaseModel):
     endpoint_latency_ms: float | None = None
     models: list[str] = []
     error: str | None = None
+
+
+TunnelSessionState = Literal[
+    "idle", "connecting", "awaiting_input", "up", "error", "stopped"]
+
+
+class TunnelSessionStatus(BaseModel):
+    """Live state of an endpoint's interactive SSH tunnel session."""
+    endpoint_id: str
+    status: TunnelSessionState = "idle"
+    prompt: str | None = None        # text ssh is waiting on, when awaiting_input
+    prompt_secret: bool = False      # mask the answer (password/passphrase)
+    output: list[str] = []           # recent, redacted terminal output
+    last_error: str | None = None
+    local_port: int | None = None
+    pid: int | None = None
+    uptime_s: float = 0.0
+
+
+class TunnelRespond(BaseModel):
+    text: str = Field(max_length=4096)
 
 
 # ---- runtime settings ------------------------------------------------

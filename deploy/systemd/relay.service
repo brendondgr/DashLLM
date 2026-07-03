@@ -1,11 +1,12 @@
 [Unit]
 Description=DashLLM relay - OpenAI-compatible LLM proxy + dashboard
-# Start after the local model server and the remote vLLM tunnel so the
-# endpoint pool is reachable quickly. These are ordering/intent hints only:
-# relay tolerates a down endpoint (health probes + failover), so it still
-# starts and serves the dashboard if a model server is unavailable.
-After=network-online.target llamacpp-router.service vllm-tunnel-skynet.service
-Wants=network-online.target vllm-tunnel-skynet.service
+# relay comes up on boot and serves the dashboard + proxy. It does NOT connect
+# any SSH tunnel on its own: tunnel-backed endpoints (e.g. skynet) are connected
+# manually from the Endpoints screen, where prompts are answered interactively.
+# We only order after the local model server so its endpoint is reachable
+# quickly; relay tolerates a down endpoint via health probes + failover.
+After=network-online.target llamacpp-router.service
+Wants=network-online.target
 
 [Service]
 Type=simple

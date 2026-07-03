@@ -33,40 +33,46 @@ cd web/backend && uv sync && \
 Runtime state lives in `web/backend/data/` and `web/backend/logs/` — both
 gitignored; back up the SQLite file to preserve history.
 
-## Run on startup (systemd user services)
+## Run on startup (systemd user service)
 
-relay and its dependencies run as **systemd user services** so the stack comes
-up on boot. Install with:
+relay runs as a **systemd user service** so the dashboard + proxy come up on
+boot. Install with:
 
 ```bash
 ./scripts/install-systemd.sh          # install + enable + start now
 ./scripts/install-systemd.sh --no-start
 ```
 
-This installs two units from `deploy/systemd/` into
-`~/.config/systemd/user/` and enables user lingering (so they start at boot
+This installs `relay.service` from `deploy/systemd/` into
+`~/.config/systemd/user/` and enables user lingering (so it starts at boot
 before login):
 
 | Unit | Purpose |
 | --- | --- |
-| `vllm-tunnel-skynet.service` | `ssh -N -L 127.0.0.1:9090:localhost:9090 skynet-alt` — the SSH tunnel to the remote vLLM, replacing the manual command so `:9090` returns on boot. Uses the running ssh-agent (`SSH_AUTH_SOCK=%t/ssh-agent.socket`), `ExitOnForwardFailure`, keepalives, `BatchMode`. |
-| `relay.service` | `uvicorn app.main:app` on `:4000`; ordered `After` the llama.cpp router and the vLLM tunnel; `Restart=always`. |
+| `relay.service` | `uvicorn app.main:app` on `:4000`; ordered `After` the llama.cpp router; `Restart=always`. |
 
 The local model server (`:7070`) is already its own service
 (`llamacpp-router.service`), so relay only `After`s it.
 
-**How the connection survives a reboot:** relay's endpoint registry lives in
-SQLite (`web/backend/data/relay.db`), not in code. Registered endpoints (their
-base URLs, aliases, `model_override`) are reloaded at startup, so relay comes
-back already knowing `local → :7070` and `skynet → :9090`. The health prober
-re-establishes their live status within a probe cycle. relay does **not**
-launch the model servers themselves — llama.cpp and the vLLM tunnel are the
-units above; relay just forwards HTTP to their ports.
+**Tunnels are manual, not on boot.** Relay never opens an SSH tunnel by itself.
+A tunnel-backed endpoint (e.g. `skynet`) stores a raw `ssh -N -L ...` command;
+you press **Connect** on the Endpoints screen to open it. The command runs in a
+pseudo-terminal, so a host-key confirmation, key passphrase, or password prompt
+pops up in the page and you answer it there — nothing is stored or logged. This
+replaces the old auto-connecting `vllm-tunnel-skynet.service`, which the install
+script removes if it finds it.
+
+**How endpoints survive a reboot:** relay's endpoint registry lives in SQLite
+(`web/backend/data/relay.db`), not in code. Registered endpoints (base URLs,
+aliases, `model_override`, `tunnel_command`) are reloaded at startup, so relay
+comes back knowing `local → :7070` and `skynet → :9090` — but the skynet
+*tunnel* stays down until you connect it. relay does **not** launch the model
+servers themselves; it just forwards HTTP to their ports.
 
 Manage / inspect:
 
 ```bash
-systemctl --user status relay.service vllm-tunnel-skynet.service
+systemctl --user status relay.service
 journalctl --user -u relay.service -f
 systemctl --user restart relay.service        # e.g. after a code change
 ```

@@ -42,8 +42,9 @@ class LiveState:
     models: list[str] = field(default_factory=list)
 
 
-def _infer_kind(url: str, tunnel_id: str | None) -> str:
-    if tunnel_id:
+def _infer_kind(url: str, tunnel_id: str | None,
+                tunnel_command: str | None = None) -> str:
+    if tunnel_id or (tunnel_command or "").strip():
         return "remote_tunnel"
     if "127.0.0.1" in url or "localhost" in url:
         return "local"
@@ -130,23 +131,29 @@ class Router:
     # ---- CRUD --------------------------------------------------------------
     def create(self, spec: EndpointCreate) -> dict:
         eid = str(uuid.uuid4())
+        tunnel_command = (spec.tunnel_command or "").strip() or None
         row = {
             "id": eid, "name": spec.name,
             "alias": self._validate_alias(spec.alias),
-            "kind": spec.kind or _infer_kind(spec.base_url, spec.tunnel_id),
+            "kind": spec.kind or _infer_kind(
+                spec.base_url, spec.tunnel_id, tunnel_command),
             "server_type": spec.server_type,
             "base_url": spec.base_url.rstrip("/"),
             "upstream_key": spec.upstream_key,
-            "tunnel_id": spec.tunnel_id, "priority": spec.priority,
+            "tunnel_id": spec.tunnel_id,
+            "tunnel_command": tunnel_command,
+            "tunnel_local_port": spec.tunnel_local_port,
+            "priority": spec.priority,
             "weight": spec.weight, "enabled": int(spec.enabled),
             "model_override": spec.model_override,
             "created_ts": time.time(),
         }
         self.db.execute(
             "INSERT INTO endpoints (id, name, alias, kind, server_type,"
-            " base_url, upstream_key, tunnel_id, priority, weight, enabled,"
+            " base_url, upstream_key, tunnel_id, tunnel_command,"
+            " tunnel_local_port, priority, weight, enabled,"
             " model_override, created_ts)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             tuple(row.values()))
         self.endpoints[eid] = row
         self.state[eid] = LiveState()
@@ -170,8 +177,12 @@ class Router:
             changes["base_url"] = changes["base_url"].rstrip("/")
         if "enabled" in changes:
             changes["enabled"] = int(changes["enabled"])
+        if "tunnel_command" in changes:
+            changes["tunnel_command"] = (
+                (changes["tunnel_command"] or "").strip() or None)
         row.update(changes)
-        row["kind"] = patch.kind or _infer_kind(row["base_url"], row["tunnel_id"])
+        row["kind"] = patch.kind or _infer_kind(
+            row["base_url"], row.get("tunnel_id"), row.get("tunnel_command"))
         sets = ", ".join(f"{k} = ?" for k in row if k != "id")
         self.db.execute(
             f"UPDATE endpoints SET {sets} WHERE id = ?",
@@ -303,6 +314,8 @@ class Router:
             kind=row["kind"],
             server_type=row["server_type"], base_url=row["base_url"],
             has_key=bool(row["upstream_key"]), tunnel_id=row["tunnel_id"],
+            tunnel_command=row.get("tunnel_command"),
+            tunnel_local_port=row.get("tunnel_local_port"),
             priority=row["priority"], weight=row["weight"],
             enabled=bool(row["enabled"]), model=st.model,
             model_override=row.get("model_override"), health=st.health,

@@ -275,14 +275,17 @@ class TunnelManager:
         log.info("tunnel stopped", extra={"data": {"id": tid}})
         return self.out(tid)
 
-    async def start_supervisor(self) -> None:
+    async def start_supervisor(self, autostart: bool = True) -> None:
         self._supervisor = asyncio.create_task(
             self._supervise(), name="tunnel-supervisor")
-        # bring enabled tunnels up at boot
-        for row in self.rows():
-            if row["enabled"]:
-                await self.start(row["id"])
-        log.info("tunnel supervisor started")
+        # Optionally bring previously-enabled tunnels up at boot. Relay runs
+        # with autostart=False so nothing connects without an explicit request.
+        if autostart:
+            for row in self.rows():
+                if row["enabled"]:
+                    await self.start(row["id"])
+        log.info("tunnel supervisor started",
+                 extra={"data": {"autostart": autostart}})
 
     async def stop_supervisor(self) -> None:
         if self._supervisor:

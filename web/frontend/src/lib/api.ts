@@ -14,6 +14,7 @@ import type {
   StatsDataset,
   SummaryOut,
   TunnelOut,
+  TunnelSessionStatus,
   TunnelTestResult,
 } from './types';
 
@@ -56,6 +57,7 @@ export const api = {
     name: string; base_url: string; server_type: string;
     upstream_key?: string | null; priority?: number;
     alias?: string | null; model_override?: string | null;
+    tunnel_command?: string | null; tunnel_local_port?: number | null;
   }) => req<EndpointOut>('POST', '/admin/endpoints', body),
   patchEndpoint: (id: string, body: Record<string, unknown>) =>
     req<EndpointOut>('PATCH', `/admin/endpoints/${id}`, body),
@@ -65,6 +67,18 @@ export const api = {
     req<RouterState>('POST', `/admin/endpoints/${id}/activate`),
   testEndpoint: (id: string) =>
     req<EndpointTestResult>('POST', `/admin/endpoints/${id}/test`),
+
+  // ---- interactive per-endpoint SSH tunnel sessions --------------------
+  tunnelSessions: () =>
+    get<TunnelSessionStatus[]>('/admin/endpoints/tunnel-sessions'),
+  tunnelStatus: (id: string) =>
+    get<TunnelSessionStatus>(`/admin/endpoints/${id}/tunnel`),
+  connectEndpointTunnel: (id: string) =>
+    req<TunnelSessionStatus>('POST', `/admin/endpoints/${id}/tunnel/connect`),
+  disconnectEndpointTunnel: (id: string) =>
+    req<TunnelSessionStatus>('POST', `/admin/endpoints/${id}/tunnel/disconnect`),
+  respondEndpointTunnel: (id: string, text: string) =>
+    req<TunnelSessionStatus>('POST', `/admin/endpoints/${id}/tunnel/respond`, { text }),
 
   // ---- tunnels --------------------------------------------------------
   tunnels: () => get<TunnelOut[]>('/admin/tunnels'),

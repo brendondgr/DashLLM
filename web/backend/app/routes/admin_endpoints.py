@@ -12,6 +12,8 @@ from app.schemas import (
     EndpointTestResult,
     RouterState,
     RouterUpdate,
+    TunnelRespond,
+    TunnelSessionStatus,
 )
 from app.security import admin_guard
 
@@ -91,6 +93,62 @@ async def test_endpoint(request: Request, eid: str):
         request.app.state.router.report_failure(
             eid, result.error or "test failed", source="probe")
     return result
+
+
+# ---- interactive SSH tunnel sessions --------------------------------------
+# Manual connect/disconnect for tunnel-backed endpoints. Nothing connects on
+# its own; ssh runs in a PTY so prompts (host key, passphrase, password) are
+# surfaced to the UI and answered via /respond.
+
+@router.get("/endpoints/tunnel-sessions",
+            response_model=list[TunnelSessionStatus])
+async def tunnel_sessions(request: Request):
+    return request.app.state.tunnel_sessions.all_status()
+
+
+def _tunnel_endpoint(request: Request, eid: str) -> dict:
+    row = request.app.state.router.endpoints.get(eid)
+    if row is None:
+        raise HTTPException(404, "endpoint not found")
+    return row
+
+
+@router.post("/endpoints/{eid}/tunnel/connect",
+             response_model=TunnelSessionStatus)
+async def tunnel_connect(request: Request, eid: str):
+    row = _tunnel_endpoint(request, eid)
+    command = (row.get("tunnel_command") or "").strip()
+    if not command:
+        raise HTTPException(
+            422, "endpoint has no tunnel_command; add one to connect")
+    try:
+        return await request.app.state.tunnel_sessions.connect(
+            eid, command, row.get("tunnel_local_port"))
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+
+
+@router.post("/endpoints/{eid}/tunnel/disconnect",
+             response_model=TunnelSessionStatus)
+async def tunnel_disconnect(request: Request, eid: str):
+    _tunnel_endpoint(request, eid)
+    return await request.app.state.tunnel_sessions.disconnect(eid)
+
+
+@router.post("/endpoints/{eid}/tunnel/respond",
+             response_model=TunnelSessionStatus)
+async def tunnel_respond(request: Request, eid: str, body: TunnelRespond):
+    _tunnel_endpoint(request, eid)
+    out = await request.app.state.tunnel_sessions.respond(eid, body.text)
+    if out is None:
+        raise HTTPException(409, "no active session awaiting input")
+    return out
+
+
+@router.get("/endpoints/{eid}/tunnel", response_model=TunnelSessionStatus)
+async def tunnel_status(request: Request, eid: str):
+    _tunnel_endpoint(request, eid)
+    return request.app.state.tunnel_sessions.status(eid)
 
 
 @router.get("/endpoints/health")

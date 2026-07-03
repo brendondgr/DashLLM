@@ -56,6 +56,8 @@ CREATE TABLE IF NOT EXISTS endpoints (
   base_url       TEXT NOT NULL,
   upstream_key   TEXT,
   tunnel_id      TEXT,
+  tunnel_command TEXT,
+  tunnel_local_port INTEGER,
   priority       INTEGER NOT NULL DEFAULT 100,
   weight         INTEGER NOT NULL DEFAULT 1,
   enabled        INTEGER NOT NULL DEFAULT 1,
@@ -119,6 +121,12 @@ class Database:
         if "model_override" not in cols:
             self._conn.execute(
                 "ALTER TABLE endpoints ADD COLUMN model_override TEXT")
+        if "tunnel_command" not in cols:
+            self._conn.execute(
+                "ALTER TABLE endpoints ADD COLUMN tunnel_command TEXT")
+        if "tunnel_local_port" not in cols:
+            self._conn.execute(
+                "ALTER TABLE endpoints ADD COLUMN tunnel_local_port INTEGER")
 
     # -- sync core -----------------------------------------------------
     def execute(self, sql: str, params: Iterable[Any] = ()) -> int:

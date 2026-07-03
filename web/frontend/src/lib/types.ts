@@ -11,6 +11,9 @@ export interface EndpointOut {
   base_url: string;
   has_key: boolean;
   tunnel_id: string | null;
+  /** Raw `ssh -N -L ...` command for a tunnel-backed endpoint (manual connect). */
+  tunnel_command: string | null;
+  tunnel_local_port: number | null;
   priority: number;
   weight: number;
   enabled: boolean;
@@ -48,6 +51,22 @@ export interface TunnelOut {
   pid: number | null;
   last_error: string | null;
   started_at: number | null;
+  uptime_s: number;
+}
+
+export type TunnelSessionState =
+  | 'idle' | 'connecting' | 'awaiting_input' | 'up' | 'error' | 'stopped';
+
+/** Live state of an endpoint's interactive SSH tunnel session. */
+export interface TunnelSessionStatus {
+  endpoint_id: string;
+  status: TunnelSessionState;
+  prompt: string | null;
+  prompt_secret: boolean;
+  output: string[];
+  last_error: string | null;
+  local_port: number | null;
+  pid: number | null;
   uptime_s: number;
 }
 

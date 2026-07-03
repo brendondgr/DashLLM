@@ -29,6 +29,7 @@ from app.services.router import Router
 from app.services.settings_store import SettingsStore
 from app.services.stats import StatsService
 from app.services.telemetry import LiveTracker, TelemetryWriter
+from app.services.tunnel_sessions import TunnelSessionManager
 from app.services.tunnels import TunnelManager
 
 log = get_logger("app")
@@ -69,9 +70,12 @@ async def lifespan(app: FastAPI):
         app.state.live, app.state.settings,
         max_concurrency=cfg.max_concurrency)
     app.state.tunnels = TunnelManager(app.state.db, app.state.http)
+    app.state.tunnel_sessions = TunnelSessionManager()
     await app.state.telemetry.start()
     await app.state.prober.start()
-    await app.state.tunnels.start_supervisor()
+    # Do NOT auto-connect tunnels on boot: interactive tunnels are connected
+    # manually from the Endpoints UI, and legacy tunnels are opt-in.
+    await app.state.tunnels.start_supervisor(autostart=False)
     task = asyncio.create_task(_housekeeping(app), name="housekeeping")
     log.info("relay started", extra={"data": {
         "version": __version__, "port": app.state.cfg.port,
@@ -80,6 +84,7 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         task.cancel()
+        await app.state.tunnel_sessions.shutdown()
         await app.state.tunnels.stop_supervisor()
         await app.state.prober.stop()
         await app.state.telemetry.stop()
