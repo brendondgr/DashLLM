@@ -16,13 +16,20 @@ from app import __version__
 from app.config import Config, config
 from app.core.logging import get_logger, setup_logging
 from app.db import Database
-from app.routes import admin_endpoints, admin_settings, admin_stats, v1
+from app.routes import (
+    admin_endpoints,
+    admin_settings,
+    admin_stats,
+    admin_tunnels,
+    v1,
+)
 from app.services.health import HealthProber
 from app.services.proxy import ProxyService
 from app.services.router import Router
 from app.services.settings_store import SettingsStore
 from app.services.stats import StatsService
 from app.services.telemetry import LiveTracker, TelemetryWriter
+from app.services.tunnels import TunnelManager
 
 log = get_logger("app")
 
@@ -61,8 +68,10 @@ async def lifespan(app: FastAPI):
         app.state.http, app.state.router, app.state.telemetry,
         app.state.live, app.state.settings,
         max_concurrency=cfg.max_concurrency)
+    app.state.tunnels = TunnelManager(app.state.db, app.state.http)
     await app.state.telemetry.start()
     await app.state.prober.start()
+    await app.state.tunnels.start_supervisor()
     task = asyncio.create_task(_housekeeping(app), name="housekeeping")
     log.info("relay started", extra={"data": {
         "version": __version__, "port": app.state.cfg.port,
@@ -71,6 +80,7 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         task.cancel()
+        await app.state.tunnels.stop_supervisor()
         await app.state.prober.stop()
         await app.state.telemetry.stop()
         await app.state.http.aclose()
@@ -124,6 +134,7 @@ def create_app(cfg: Config | None = None) -> FastAPI:
     app.include_router(admin_endpoints.router)
     app.include_router(admin_settings.router)
     app.include_router(admin_stats.router)
+    app.include_router(admin_tunnels.router)
 
     _mount_static_dashboard(app, cfg)
     return app
