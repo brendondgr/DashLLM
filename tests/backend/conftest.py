@@ -35,3 +35,24 @@ def app(cfg):
 def client(app):
     with TestClient(app) as c:  # context manager runs lifespan
         yield c
+
+
+@pytest.fixture
+def proxy_env(cfg):
+    """App wired to a fake upstream via a routing transport.
+
+    Yields (client, app, upstream_calls). Hosts: good / flaky / dead.
+    """
+    import httpx
+
+    from fake_upstream import RoutingTransport, make_upstream
+
+    upstream, calls = make_upstream()
+    app = create_app(cfg)
+    with TestClient(app) as c:
+        fake = httpx.AsyncClient(
+            transport=RoutingTransport(upstream), timeout=5.0)
+        app.state.http = fake
+        app.state.proxy.http = fake
+        app.state.prober.http = fake
+        yield c, app, calls

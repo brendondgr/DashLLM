@@ -25,6 +25,7 @@ class Config(BaseSettings):
     log_level: str = "INFO"
 
     admin_token: str = ""  # empty = admin plane open (localhost use)
+    require_client_key: bool = False  # enforce Bearer key on /v1/*
 
     # Health prober
     probe_interval: float = 15.0

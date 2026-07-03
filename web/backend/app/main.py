@@ -16,10 +16,12 @@ from app import __version__
 from app.config import Config, config
 from app.core.logging import get_logger, setup_logging
 from app.db import Database
-from app.routes import admin_endpoints, admin_settings
+from app.routes import admin_endpoints, admin_settings, admin_stats, v1
 from app.services.health import HealthProber
+from app.services.proxy import ProxyService
 from app.services.router import Router
 from app.services.settings_store import SettingsStore
+from app.services.stats import StatsService
 from app.services.telemetry import LiveTracker, TelemetryWriter
 
 log = get_logger("app")
@@ -55,6 +57,10 @@ async def lifespan(app: FastAPI):
     app.state.prober = HealthProber(
         app.state.router, app.state.http,
         interval=cfg.probe_interval, timeout=cfg.probe_timeout)
+    app.state.proxy = ProxyService(
+        app.state.http, app.state.router, app.state.telemetry,
+        app.state.live, app.state.settings,
+        max_concurrency=cfg.max_concurrency)
     await app.state.telemetry.start()
     await app.state.prober.start()
     task = asyncio.create_task(_housekeeping(app), name="housekeeping")
@@ -85,6 +91,7 @@ def create_app(cfg: Config | None = None) -> FastAPI:
     app.state.router = Router(
         app.state.db, unhealthy_after=cfg.unhealthy_after,
         recover_after=cfg.recover_after)
+    app.state.stats = StatsService(app.state.db, app.state.live)
 
     @app.middleware("http")
     async def cors_and_access_log(request: Request, call_next):
@@ -113,8 +120,10 @@ def create_app(cfg: Config | None = None) -> FastAPI:
             "uptime_s": round(app.state.settings.uptime_s(), 1),
         }
 
+    app.include_router(v1.router)
     app.include_router(admin_endpoints.router)
     app.include_router(admin_settings.router)
+    app.include_router(admin_stats.router)
 
     _mount_static_dashboard(app, cfg)
     return app
