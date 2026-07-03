@@ -1,0 +1,271 @@
+"""Endpoint registry + live health state + resolution policy.
+
+The pool lives in memory (rebuilt from DB on boot, mutated by the control
+plane). Requests resolve their upstream at call time from this live state,
+so hot-swap/failover is just a state mutation — no restart, in-flight
+requests untouched.
+
+Health state machine (active probes + passive request signals):
+
+        probe ok / request ok
+   ┌───────────────◀───────────────┐
+HEALTHY ──fails ≥ N──▶ DEGRADED ──fails keep coming──▶ FAILED (out of pool)
+   ▲                                                      │
+   └────────── M consecutive probe successes ◀────────────┘
+"""
+
+import time
+import uuid
+from dataclasses import dataclass, field
+
+from app.core.logging import get_logger
+from app.db import Database
+from app.schemas import EndpointCreate, EndpointOut, EndpointPatch, RouterState
+
+log = get_logger("router")
+
+_POLICY_KEY = "router_policy"
+_PINNED_KEY = "router_pinned"
+
+
+@dataclass
+class LiveState:
+    health: str = "unknown"  # unknown|healthy|degraded|failed
+    consecutive_fails: int = 0
+    consecutive_probe_ok: int = 0
+    ewma_latency_ms: float | None = None
+    last_ok_ts: float | None = None
+    model: str | None = None
+    models: list[str] = field(default_factory=list)
+
+
+def _infer_kind(url: str, tunnel_id: str | None) -> str:
+    if tunnel_id:
+        return "remote_tunnel"
+    if "127.0.0.1" in url or "localhost" in url:
+        return "local"
+    return "remote_direct"
+
+
+class Router:
+    def __init__(self, db: Database, unhealthy_after: int = 3, recover_after: int = 2):
+        self.db = db
+        self.unhealthy_after = unhealthy_after
+        self.recover_after = recover_after
+        self.endpoints: dict[str, dict] = {}
+        self.state: dict[str, LiveState] = {}
+        self.policy: str = "manual"
+        self.pinned_id: str | None = None
+        self._load()
+
+    # ---- persistence -----------------------------------------------------
+    def _load(self) -> None:
+        for row in self.db.query("SELECT * FROM endpoints"):
+            self.endpoints[row["id"]] = row
+            self.state[row["id"]] = LiveState()
+        pol = self.db.query_one(
+            "SELECT value FROM settings WHERE key = ?", (_POLICY_KEY,))
+        pin = self.db.query_one(
+            "SELECT value FROM settings WHERE key = ?", (_PINNED_KEY,))
+        self.policy = pol["value"] if pol else "manual"
+        self.pinned_id = pin["value"] if pin and pin["value"] in self.endpoints else None
+        if self.pinned_id is None and self.endpoints:
+            self.pinned_id = next(iter(self.endpoints))
+        log.info("router loaded", extra={"data": {
+            "endpoints": len(self.endpoints), "policy": self.policy,
+            "pinned": self.pinned_id}})
+
+    def _persist_router(self) -> None:
+        self.db.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+            (_POLICY_KEY, self.policy))
+        self.db.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+            (_PINNED_KEY, self.pinned_id or ""))
+
+    # ---- CRUD --------------------------------------------------------------
+    def create(self, spec: EndpointCreate) -> dict:
+        eid = str(uuid.uuid4())
+        row = {
+            "id": eid, "name": spec.name,
+            "kind": spec.kind or _infer_kind(spec.base_url, spec.tunnel_id),
+            "server_type": spec.server_type,
+            "base_url": spec.base_url.rstrip("/"),
+            "upstream_key": spec.upstream_key,
+            "tunnel_id": spec.tunnel_id, "priority": spec.priority,
+            "weight": spec.weight, "enabled": int(spec.enabled),
+            "created_ts": time.time(),
+        }
+        self.db.execute(
+            "INSERT INTO endpoints (id, name, kind, server_type, base_url,"
+            " upstream_key, tunnel_id, priority, weight, enabled, created_ts)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            tuple(row.values()))
+        self.endpoints[eid] = row
+        self.state[eid] = LiveState()
+        if self.pinned_id is None:
+            self.pinned_id = eid
+            self._persist_router()
+        log.info("endpoint created", extra={"data": {
+            "id": eid, "name": row["name"], "url": row["base_url"],
+            "kind": row["kind"]}})
+        return row
+
+    def patch(self, eid: str, patch: EndpointPatch) -> dict | None:
+        row = self.endpoints.get(eid)
+        if row is None:
+            return None
+        changes = patch.model_dump(exclude_none=True)
+        if "base_url" in changes:
+            changes["base_url"] = changes["base_url"].rstrip("/")
+        if "enabled" in changes:
+            changes["enabled"] = int(changes["enabled"])
+        row.update(changes)
+        row["kind"] = patch.kind or _infer_kind(row["base_url"], row["tunnel_id"])
+        sets = ", ".join(f"{k} = ?" for k in row if k != "id")
+        self.db.execute(
+            f"UPDATE endpoints SET {sets} WHERE id = ?",
+            [v for k, v in row.items() if k != "id"] + [eid])
+        if "base_url" in changes:
+            self.state[eid] = LiveState()  # URL changed: health unknown again
+        log.info("endpoint updated", extra={"data": {"id": eid, **changes}})
+        return row
+
+    def delete(self, eid: str) -> bool:
+        if eid not in self.endpoints:
+            return False
+        self.db.execute("DELETE FROM endpoints WHERE id = ?", (eid,))
+        self.endpoints.pop(eid)
+        self.state.pop(eid, None)
+        if self.pinned_id == eid:
+            self.pinned_id = next(iter(self.endpoints), None)
+            self._persist_router()
+        log.info("endpoint deleted", extra={"data": {"id": eid}})
+        return True
+
+    # ---- policy / hot-swap ---------------------------------------------------
+    def activate(self, eid: str) -> bool:
+        """Hot-swap: pin as the active endpoint. Next request routes here."""
+        if eid not in self.endpoints:
+            return False
+        prev = self.pinned_id
+        self.pinned_id = eid
+        self._persist_router()
+        log.info("hot-swap", extra={"data": {
+            "from": self.endpoints.get(prev, {}).get("name") if prev else None,
+            "to": self.endpoints[eid]["name"]}})
+        return True
+
+    def set_policy(self, policy: str | None, pinned_id: str | None) -> None:
+        if policy:
+            self.policy = policy
+        if pinned_id is not None:
+            if pinned_id and pinned_id not in self.endpoints:
+                raise KeyError(pinned_id)
+            self.pinned_id = pinned_id or None
+        self._persist_router()
+        log.info("router policy updated", extra={"data": {
+            "policy": self.policy, "pinned": self.pinned_id}})
+
+    # ---- resolution -----------------------------------------------------------
+    def _eligible(self, exclude: set[str]) -> list[dict]:
+        rows = [
+            r for r in self.endpoints.values()
+            if r["enabled"] and r["id"] not in exclude
+            and self.state[r["id"]].health != "failed"
+        ]
+        rows.sort(key=lambda r: (-r["priority"], r["created_ts"] or 0))
+        return rows
+
+    def resolve(self, exclude: set[str] | None = None,
+                auto_failover: bool = True) -> dict | None:
+        """Pick the upstream for a request, honoring pin + failover."""
+        exclude = exclude or set()
+        if self.policy == "manual" and self.pinned_id:
+            pinned = self.endpoints.get(self.pinned_id)
+            if pinned and pinned["enabled"] and self.pinned_id not in exclude:
+                if self.state[self.pinned_id].health != "failed":
+                    return pinned
+                if not auto_failover:
+                    return pinned  # pinned hard: let the request surface the error
+        candidates = self._eligible(exclude)
+        if self.policy == "manual" and not auto_failover:
+            return None
+        return candidates[0] if candidates else None
+
+    # ---- health signals ---------------------------------------------------------
+    def report_success(self, eid: str, latency_ms: float | None = None,
+                       source: str = "request") -> None:
+        st = self.state.get(eid)
+        if st is None:
+            return
+        prev = st.health
+        st.last_ok_ts = time.time()
+        if latency_ms is not None:
+            st.ewma_latency_ms = (
+                latency_ms if st.ewma_latency_ms is None
+                else 0.3 * latency_ms + 0.7 * st.ewma_latency_ms)
+        if st.health == "failed":
+            if source == "probe":
+                st.consecutive_probe_ok += 1
+                if st.consecutive_probe_ok >= self.recover_after:
+                    st.health = "healthy"
+                    st.consecutive_fails = 0
+            # request successes alone don't recover a FAILED endpoint
+        else:
+            st.health = "healthy"
+            st.consecutive_fails = 0
+            st.consecutive_probe_ok += 1
+        if prev != st.health:
+            log.info("health transition", extra={"data": {
+                "endpoint": self.endpoints[eid]["name"], "from": prev,
+                "to": st.health, "source": source}})
+
+    def report_failure(self, eid: str, error: str, source: str = "request") -> None:
+        st = self.state.get(eid)
+        if st is None:
+            return
+        prev = st.health
+        st.consecutive_fails += 1
+        st.consecutive_probe_ok = 0
+        if st.consecutive_fails >= self.unhealthy_after:
+            st.health = "failed"
+        else:
+            st.health = "degraded"
+        level = log.warning if st.health != prev else log.debug
+        level("endpoint failure", extra={"data": {
+            "endpoint": self.endpoints[eid]["name"], "error": error[:300],
+            "fails": st.consecutive_fails, "from": prev, "to": st.health,
+            "source": source}})
+
+    def set_models(self, eid: str, models: list[str]) -> None:
+        st = self.state.get(eid)
+        if st is not None:
+            st.models = models
+            st.model = models[0] if models else None
+
+    # ---- views -----------------------------------------------------------------
+    def out(self, eid: str, share: float = 0.0) -> EndpointOut:
+        row = self.endpoints[eid]
+        st = self.state[eid]
+        return EndpointOut(
+            id=row["id"], name=row["name"], kind=row["kind"],
+            server_type=row["server_type"], base_url=row["base_url"],
+            has_key=bool(row["upstream_key"]), tunnel_id=row["tunnel_id"],
+            priority=row["priority"], weight=row["weight"],
+            enabled=bool(row["enabled"]), model=st.model, health=st.health,
+            ewma_latency_ms=(
+                round(st.ewma_latency_ms, 1) if st.ewma_latency_ms else None),
+            last_ok_ts=st.last_ok_ts, consecutive_fails=st.consecutive_fails,
+            active=(row["id"] == self.pinned_id), share=round(share, 4))
+
+    def list_out(self, shares: dict[str, float] | None = None) -> list[EndpointOut]:
+        shares = shares or {}
+        return [self.out(eid, shares.get(eid, 0.0)) for eid in self.endpoints]
+
+    def router_state(self, auto_failover: bool = True) -> RouterState:
+        resolved = self.resolve(auto_failover=auto_failover)
+        return RouterState(
+            policy=self.policy, pinned_id=self.pinned_id,
+            resolved_id=resolved["id"] if resolved else None,
+            resolved_name=resolved["name"] if resolved else None)

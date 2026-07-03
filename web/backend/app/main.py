@@ -9,12 +9,16 @@ the built dashboard (web/frontend/dist) is served statically from "/".
 import asyncio
 from contextlib import asynccontextmanager
 
+import httpx
 from fastapi import FastAPI, Request, Response
 
 from app import __version__
 from app.config import Config, config
 from app.core.logging import get_logger, setup_logging
 from app.db import Database
+from app.routes import admin_endpoints, admin_settings
+from app.services.health import HealthProber
+from app.services.router import Router
 from app.services.settings_store import SettingsStore
 from app.services.telemetry import LiveTracker, TelemetryWriter
 
@@ -41,7 +45,18 @@ async def _housekeeping(app: FastAPI) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    cfg = app.state.cfg
+    app.state.http = httpx.AsyncClient(
+        timeout=httpx.Timeout(
+            connect=cfg.connect_timeout, read=cfg.read_timeout,
+            write=cfg.write_timeout, pool=30.0),
+        limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
+    )
+    app.state.prober = HealthProber(
+        app.state.router, app.state.http,
+        interval=cfg.probe_interval, timeout=cfg.probe_timeout)
     await app.state.telemetry.start()
+    await app.state.prober.start()
     task = asyncio.create_task(_housekeeping(app), name="housekeeping")
     log.info("relay started", extra={"data": {
         "version": __version__, "port": app.state.cfg.port,
@@ -50,7 +65,9 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         task.cancel()
+        await app.state.prober.stop()
         await app.state.telemetry.stop()
+        await app.state.http.aclose()
         app.state.db.close()
         log.info("relay stopped")
 
@@ -65,6 +82,9 @@ def create_app(cfg: Config | None = None) -> FastAPI:
     app.state.settings = SettingsStore(app.state.db, boot_port=cfg.port)
     app.state.telemetry = TelemetryWriter(app.state.db)
     app.state.live = LiveTracker()
+    app.state.router = Router(
+        app.state.db, unhealthy_after=cfg.unhealthy_after,
+        recover_after=cfg.recover_after)
 
     @app.middleware("http")
     async def cors_and_access_log(request: Request, call_next):
@@ -92,6 +112,9 @@ def create_app(cfg: Config | None = None) -> FastAPI:
             "version": __version__,
             "uptime_s": round(app.state.settings.uptime_s(), 1),
         }
+
+    app.include_router(admin_endpoints.router)
+    app.include_router(admin_settings.router)
 
     _mount_static_dashboard(app, cfg)
     return app
