@@ -170,10 +170,15 @@ class ProxyService:
                         extra={"data": {"id": req_id, "route": route}})
             return _upstream_error(429, "concurrency limit reached")
 
+        # "auto" (the advertised default) is rewritten per resolved endpoint
+        # at forward time — upstreams don't know a model called "auto".
+        rewrite_auto = requested_model == "auto" and body_json is not None
+
         async with self._slots:
             return await self._dispatch(
                 request, path, record, body_bytes, t0,
-                force_endpoint=alias_endpoint)
+                force_endpoint=alias_endpoint,
+                body_json=body_json if rewrite_auto else None)
 
     def _parse_json(self, body: bytes) -> dict | None:
         if not body:
@@ -209,9 +214,20 @@ class ProxyService:
     # ---- forwarding with pre-first-byte failover -------------------------
     async def _dispatch(self, request: Request, path: str,
                         record: RequestRecord, body: bytes,
-                        t0: float, force_endpoint: dict | None = None
-                        ) -> Response:
+                        t0: float, force_endpoint: dict | None = None,
+                        body_json: dict | None = None) -> Response:
         settings = self.settings.current
+
+        def body_for(endpoint: dict) -> bytes:
+            """Rewrite model=auto to the endpoint's real model (failover may
+            pick endpoints running different models, so this is per-attempt)."""
+            if body_json is None:
+                return body
+            upstream_model = self.router.upstream_model(endpoint["id"])
+            if not upstream_model:
+                return body
+            record.model = upstream_model
+            return json.dumps({**body_json, "model": upstream_model}).encode()
 
         # Alias-pinned: the caller asked for THIS server by name; no silent
         # failover to a different one. Surface errors instead.
@@ -228,7 +244,8 @@ class ProxyService:
                     " is disabled")
             try:
                 return await self._forward(
-                    request, force_endpoint, path, record, body, t0)
+                    request, force_endpoint, path, record,
+                    body_for(force_endpoint), t0)
             except _RetryableUpstreamError as e:
                 self.router.report_failure(force_endpoint["id"], str(e))
                 record.error = str(e)[:500]
@@ -260,7 +277,7 @@ class ProxyService:
             record.endpoint_name = endpoint["name"]
             try:
                 return await self._forward(
-                    request, endpoint, path, record, body, t0)
+                    request, endpoint, path, record, body_for(endpoint), t0)
             except _RetryableUpstreamError as e:
                 self.router.report_failure(endpoint["id"], str(e))
                 log.warning("upstream failed pre-first-byte", extra={"data": {

@@ -165,6 +165,20 @@ to validate health detection and failover for real).
   llama.cpp, seed/validation utilities, and final documentation. Then merge
   the worktree branch into `main`, fixing any issues.
 
+## 3b. Mid-build change request (added during Step 6)
+
+**Model-alias routing** — requested by the user during the build: each
+endpoint may carry a unique routing `alias` (e.g. `skynet`, `local`). A `/v1`
+request whose `model` matches an alias is pinned to that endpoint and the
+model field is rewritten to the endpoint's real model (`model_override` or
+prober-discovered) before forwarding; alias-pinned requests do not fail over.
+`model: "auto"` is likewise rewritten per resolved endpoint at forward time.
+`GET /v1/models` is synthesized to advertise `auto` + all aliases.
+Implemented across `router.py`, `proxy.py`, `db.py` (additive migration),
+schemas, the Endpoints screen (alias form field + badge), tests
+(`test_proxy.py`, alias cases), and docs. Validated live against llama.cpp
+(:7070, alias `local`) and vLLM (:9090, alias `skynet`).
+
 ## 4. Deliverables Table
 
 | Deliverable | Description | Location (File/Path) |

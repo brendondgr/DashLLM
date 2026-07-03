@@ -51,4 +51,8 @@ root/
 | `utils/seed_telemetry.py` | Seed synthetic 30-day telemetry for dev |
 | `scripts/validate_live.sh` | Live end-to-end validation |
 
-*Kept up to date as the build progresses (finalized in Step 7).*
+Other root files: `.claude/launch.json` (preview/dev launch config for the
+relay server), `scripts/dev.sh` (backend + frontend dev processes),
+`scripts/validate_live.sh` (live e2e checks).
+
+*Last updated: 2026-07-03 (build complete, incl. model-alias routing).*

@@ -137,6 +137,16 @@ def test_alias_routing_does_not_fail_over(proxy_env):
     assert row["endpoint_name"] == "dead-named" and row["ok"] == 0
 
 
+def test_auto_model_rewritten_to_endpoint_model(proxy_env):
+    client, app, calls = proxy_env
+    _register(client, "good", "http://good/v1")
+    r = client.post("/v1/chat/completions", json={
+        "model": "auto", "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 200
+    # upstream never sees the literal "auto" — prober-discovered model is sent
+    assert calls["last_model"] == "fake-model-7b"
+
+
 def test_duplicate_alias_rejected(proxy_env):
     client, app, calls = proxy_env
     _register(client, "a", "http://good/v1", alias="skynet")
