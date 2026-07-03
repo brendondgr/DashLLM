@@ -117,8 +117,29 @@ class ProxyService:
         route = _route_name(path)
         client_key = mask_key(extract_bearer(request))
 
+        if route == "models" and request.method == "GET":
+            return self._models_catalog()
+
         body_bytes = await request.body()
         body_json = self._parse_json(body_bytes)
+
+        # Model-alias routing: a request whose "model" matches an endpoint
+        # alias is pinned to that endpoint; the model field is rewritten to
+        # what that server actually runs (override or discovered).
+        alias_endpoint: dict | None = None
+        requested_model = (body_json or {}).get("model")
+        if requested_model and requested_model != "auto":
+            alias_endpoint = self.router.resolve_alias(requested_model)
+            if alias_endpoint is not None and body_json is not None:
+                upstream_model = self.router.upstream_model(
+                    alias_endpoint["id"])
+                if upstream_model:
+                    body_json["model"] = upstream_model
+                log.info("alias route", extra={"data": {
+                    "id": req_id, "alias": requested_model,
+                    "endpoint": alias_endpoint["name"],
+                    "upstream_model": upstream_model or requested_model}})
+
         want_stream = bool(body_json.get("stream")) if body_json else False
         settings = self.settings.current
         if want_stream and not settings.stream_passthrough and body_json:
@@ -151,7 +172,8 @@ class ProxyService:
 
         async with self._slots:
             return await self._dispatch(
-                request, path, record, body_bytes, t0)
+                request, path, record, body_bytes, t0,
+                force_endpoint=alias_endpoint)
 
     def _parse_json(self, body: bytes) -> dict | None:
         if not body:
@@ -162,11 +184,63 @@ class ProxyService:
         except (json.JSONDecodeError, UnicodeDecodeError):
             return None
 
+    def _models_catalog(self) -> JSONResponse:
+        """Synthesized /v1/models: "auto" + every enabled endpoint alias, so
+        OpenAI clients can discover the routing names (skynet, local, ...)."""
+        created = int(time.time())
+        data = [{"id": "auto", "object": "model", "created": created,
+                 "owned_by": "relay",
+                 "relay": {"routing": "active endpoint (hot-swap)"}}]
+        for row in self.router.endpoints.values():
+            if not row.get("alias") or not row["enabled"]:
+                continue
+            st = self.router.state.get(row["id"])
+            data.append({
+                "id": row["alias"], "object": "model", "created": created,
+                "owned_by": f"relay:{row['name']}",
+                "relay": {
+                    "endpoint": row["name"],
+                    "health": st.health if st else "unknown",
+                    "upstream_model": self.router.upstream_model(row["id"]),
+                },
+            })
+        return JSONResponse({"object": "list", "data": data})
+
     # ---- forwarding with pre-first-byte failover -------------------------
     async def _dispatch(self, request: Request, path: str,
                         record: RequestRecord, body: bytes,
-                        t0: float) -> Response:
+                        t0: float, force_endpoint: dict | None = None
+                        ) -> Response:
         settings = self.settings.current
+
+        # Alias-pinned: the caller asked for THIS server by name; no silent
+        # failover to a different one. Surface errors instead.
+        if force_endpoint is not None:
+            record.endpoint_id = force_endpoint["id"]
+            record.endpoint_name = force_endpoint["name"]
+            if not force_endpoint["enabled"]:
+                record.error = "alias endpoint disabled"
+                record.status = 503
+                record.latency_ms = (time.perf_counter() - t0) * 1000
+                self.telemetry.submit(record)
+                return _upstream_error(
+                    503, f"endpoint for model {force_endpoint['alias']!r}"
+                    " is disabled")
+            try:
+                return await self._forward(
+                    request, force_endpoint, path, record, body, t0)
+            except _RetryableUpstreamError as e:
+                self.router.report_failure(force_endpoint["id"], str(e))
+                record.error = str(e)[:500]
+                record.status = e.status or 502
+                record.ok = False
+                record.latency_ms = (time.perf_counter() - t0) * 1000
+                self.telemetry.submit(record)
+                log.warning("alias endpoint failed", extra={"data": {
+                    "id": record.id, "endpoint": force_endpoint["name"],
+                    "error": str(e)[:200]}})
+                return _upstream_error(record.status, f"upstream error: {e}")
+
         tried: set[str] = set()
         attempts = 0
         while True:

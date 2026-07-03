@@ -16,7 +16,7 @@ Proxy Info, Settings.
 | POST | `/v1/chat/completions` | primary; streaming + non-streaming, fully instrumented |
 | POST | `/v1/completions` | instrumented |
 | POST | `/v1/embeddings` | instrumented |
-| GET | `/v1/models` | proxied; doubles as health/test probe |
+| GET | `/v1/models` | synthesized: `auto` + every enabled endpoint alias (model-alias routing) |
 | ANY | `/v1/{path}` | generic passthrough, recorded coarsely |
 
 ## Backend — control plane

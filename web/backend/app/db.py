@@ -48,17 +48,19 @@ CREATE TABLE IF NOT EXISTS request_bodies (
 );
 
 CREATE TABLE IF NOT EXISTS endpoints (
-  id           TEXT PRIMARY KEY,
-  name         TEXT NOT NULL,
-  kind         TEXT NOT NULL DEFAULT 'local',
-  server_type  TEXT DEFAULT 'openai',
-  base_url     TEXT NOT NULL,
-  upstream_key TEXT,
-  tunnel_id    TEXT,
-  priority     INTEGER NOT NULL DEFAULT 100,
-  weight       INTEGER NOT NULL DEFAULT 1,
-  enabled      INTEGER NOT NULL DEFAULT 1,
-  created_ts   REAL
+  id             TEXT PRIMARY KEY,
+  name           TEXT NOT NULL,
+  alias          TEXT,
+  kind           TEXT NOT NULL DEFAULT 'local',
+  server_type    TEXT DEFAULT 'openai',
+  base_url       TEXT NOT NULL,
+  upstream_key   TEXT,
+  tunnel_id      TEXT,
+  priority       INTEGER NOT NULL DEFAULT 100,
+  weight         INTEGER NOT NULL DEFAULT 1,
+  enabled        INTEGER NOT NULL DEFAULT 1,
+  model_override TEXT,
+  created_ts     REAL
 );
 
 CREATE TABLE IF NOT EXISTS tunnels (
@@ -104,7 +106,19 @@ class Database:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA synchronous=NORMAL")
             self._conn.executescript(SCHEMA)
+            self._migrate()
             self._conn.commit()
+
+    def _migrate(self) -> None:
+        """Additive migrations for DBs created before newer columns."""
+        cols = {
+            r[1] for r in self._conn.execute("PRAGMA table_info(endpoints)")
+        }
+        if "alias" not in cols:
+            self._conn.execute("ALTER TABLE endpoints ADD COLUMN alias TEXT")
+        if "model_override" not in cols:
+            self._conn.execute(
+                "ALTER TABLE endpoints ADD COLUMN model_override TEXT")
 
     # -- sync core -----------------------------------------------------
     def execute(self, sql: str, params: Iterable[Any] = ()) -> int:

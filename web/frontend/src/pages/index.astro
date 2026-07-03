@@ -1,7 +1,8 @@
 ---
+import App from '../components/App';
 import Base from '../layouts/Base.astro';
 ---
 
 <Base title="relay · LLM proxy">
-  <div id="app-root" style="height:100vh"></div>
+  <App client:only="react" />
 </Base>

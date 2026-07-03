@@ -26,6 +26,15 @@ const { title } = Astro.props;
       @keyframes livepulse { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
       @keyframes rowstream { 0%, 100% { background: rgba(88, 196, 221, .05); } 50% { background: rgba(88, 196, 221, .12); } }
       @keyframes spin { to { transform: rotate(360deg); } }
+      /* hover states ported from the prototype's style-hover attributes */
+      .hv-bg:hover { background: #161C28 !important; color: #E6EAF2 !important; }
+      .hv-border:hover { border-color: #3A4A63 !important; }
+      .hv-text:hover { color: #E6EAF2 !important; }
+      .hv-row:hover { background: #1A2233 !important; }
+      .hv-rowdark:hover { background: #151B27 !important; }
+      .hv-bright:hover { filter: brightness(1.1); }
+      .hv-under:hover { text-decoration: underline; }
+      .hv-accent:hover { border-color: #FFB224 !important; color: #FFB224 !important; }
     </style>
   </head>
   <body>

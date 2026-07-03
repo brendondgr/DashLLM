@@ -40,7 +40,10 @@ async def list_endpoints(request: Request):
 async def create_endpoint(request: Request, spec: EndpointCreate):
     if not spec.base_url.startswith(("http://", "https://")):
         raise HTTPException(422, "base_url must start with http:// or https://")
-    row = request.app.state.router.create(spec)
+    try:
+        row = request.app.state.router.create(spec)
+    except ValueError as e:
+        raise HTTPException(422, str(e))
     # Probe immediately so the UI shows real health, not 'unknown'.
     await request.app.state.prober._probe(row["id"])
     return request.app.state.router.out(row["id"])
@@ -48,7 +51,10 @@ async def create_endpoint(request: Request, spec: EndpointCreate):
 
 @router.patch("/endpoints/{eid}", response_model=EndpointOut)
 async def patch_endpoint(request: Request, eid: str, patch: EndpointPatch):
-    row = request.app.state.router.patch(eid, patch)
+    try:
+        row = request.app.state.router.patch(eid, patch)
+    except ValueError as e:
+        raise HTTPException(422, str(e))
     if row is None:
         raise HTTPException(404, "endpoint not found")
     return request.app.state.router.out(eid)

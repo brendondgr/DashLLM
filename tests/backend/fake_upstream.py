@@ -16,7 +16,8 @@ from fastapi.responses import StreamingResponse
 
 def make_upstream() -> tuple[FastAPI, dict]:
     up = FastAPI()
-    calls = {"chat": 0, "models": 0, "saw_include_usage": False}
+    calls = {"chat": 0, "models": 0, "saw_include_usage": False,
+             "last_model": None}
 
     @up.get("/v1/models")
     async def models():
@@ -27,6 +28,7 @@ def make_upstream() -> tuple[FastAPI, dict]:
     async def chat(request: Request):
         calls["chat"] += 1
         body = await request.json()
+        calls["last_model"] = body.get("model")
         if body.get("stream"):
             include_usage = bool(
                 (body.get("stream_options") or {}).get("include_usage"))

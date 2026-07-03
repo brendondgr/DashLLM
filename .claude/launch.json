@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "relay",
+      "runtimeExecutable": "uv",
+      "runtimeArgs": ["run", "--project", "web/backend", "uvicorn", "app.main:app", "--port", "4000"],
+      "port": 4000
+    }
+  ]
+}

@@ -21,11 +21,13 @@ typed client (`web/frontend/src/lib/api.ts`) mirrors these shapes.
 ### Endpoint
 ```json
 {
-  "id": "uuid", "name": "llama.cpp · local", "kind": "local|remote_direct|remote_tunnel",
+  "id": "uuid", "name": "llama.cpp · local", "alias": "local",
+  "kind": "local|remote_direct|remote_tunnel",
   "server_type": "llama.cpp|vLLM|ollama|openai",
   "base_url": "http://127.0.0.1:7070/v1",
   "has_key": false, "tunnel_id": null,
   "priority": 100, "enabled": true, "model": "gemma-4-26B-it",
+  "model_override": null,
   "health": "healthy|degraded|failed|unknown",
   "ewma_latency_ms": 42.1, "last_ok_ts": 1780000000.0,
   "consecutive_fails": 0, "active": true, "share": 0.46
@@ -34,6 +36,22 @@ typed client (`web/frontend/src/lib/api.ts`) mirrors these shapes.
 `model` is discovered from the endpoint's `/v1/models`. `share` is that
 endpoint's fraction of requests in the last 24h. `active` marks the router's
 current resolved target.
+
+### Model-alias routing
+
+`alias` is a unique routing name (`[A-Za-z0-9._-]`, max 64, `auto` reserved,
+case-insensitive). A `/v1` request whose body `model` matches an alias is
+**pinned to that endpoint**: relay rewrites `model` to `model_override` (if
+set) or the endpoint's discovered default model before forwarding, so the
+client never needs to know what is actually running there. Alias-pinned
+requests do **not** fail over to other endpoints — the caller asked for that
+server by name. `model: "auto"` (or any non-alias value) uses the normal
+active-endpoint / priority-failover resolution.
+
+`GET /v1/models` is synthesized by relay: it lists `auto` plus every enabled
+endpoint's alias (with `relay.endpoint`, `relay.health`,
+`relay.upstream_model` metadata), so OpenAI clients can discover the routing
+names.
 
 ### Tunnel
 ```json

@@ -14,6 +14,7 @@ HEALTHY ──fails ≥ N──▶ DEGRADED ──fails keep coming──▶ FAI
    └────────── M consecutive probe successes ◀────────────┘
 """
 
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -26,6 +27,8 @@ log = get_logger("router")
 
 _POLICY_KEY = "router_policy"
 _PINNED_KEY = "router_pinned"
+_ALIAS_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_RESERVED_ALIASES = {"auto"}
 
 
 @dataclass
@@ -83,23 +86,67 @@ class Router:
             "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
             (_PINNED_KEY, self.pinned_id or ""))
 
+    # ---- alias routing --------------------------------------------------------
+    def _validate_alias(self, alias: str | None,
+                        exclude_id: str | None = None) -> str | None:
+        """Normalize + validate a routing alias. Raises ValueError."""
+        if alias is None:
+            return None
+        alias = alias.strip()
+        if not alias:
+            return None
+        if not _ALIAS_RE.match(alias):
+            raise ValueError(
+                "alias must be letters/digits/._- (max 64 chars)")
+        if alias.lower() in _RESERVED_ALIASES:
+            raise ValueError(f"alias {alias!r} is reserved")
+        for eid, row in self.endpoints.items():
+            if eid != exclude_id and (row.get("alias") or "").lower() == alias.lower():
+                raise ValueError(
+                    f"alias {alias!r} already used by endpoint {row['name']!r}")
+        return alias
+
+    def resolve_alias(self, model: str | None) -> dict | None:
+        """Endpoint whose alias matches the requested model name."""
+        if not model:
+            return None
+        wanted = model.strip().lower()
+        for row in self.endpoints.values():
+            if (row.get("alias") or "").lower() == wanted:
+                return row
+        return None
+
+    def upstream_model(self, eid: str) -> str | None:
+        """Model to send upstream for alias-routed requests: explicit
+        override, else the endpoint's discovered default model."""
+        row = self.endpoints.get(eid)
+        if row is None:
+            return None
+        if row.get("model_override"):
+            return row["model_override"]
+        st = self.state.get(eid)
+        return st.model if st else None
+
     # ---- CRUD --------------------------------------------------------------
     def create(self, spec: EndpointCreate) -> dict:
         eid = str(uuid.uuid4())
         row = {
             "id": eid, "name": spec.name,
+            "alias": self._validate_alias(spec.alias),
             "kind": spec.kind or _infer_kind(spec.base_url, spec.tunnel_id),
             "server_type": spec.server_type,
             "base_url": spec.base_url.rstrip("/"),
             "upstream_key": spec.upstream_key,
             "tunnel_id": spec.tunnel_id, "priority": spec.priority,
             "weight": spec.weight, "enabled": int(spec.enabled),
+            "model_override": spec.model_override,
             "created_ts": time.time(),
         }
         self.db.execute(
-            "INSERT INTO endpoints (id, name, kind, server_type, base_url,"
-            " upstream_key, tunnel_id, priority, weight, enabled, created_ts)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO endpoints (id, name, alias, kind, server_type,"
+            " base_url, upstream_key, tunnel_id, priority, weight, enabled,"
+            " model_override, created_ts)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
             tuple(row.values()))
         self.endpoints[eid] = row
         self.state[eid] = LiveState()
@@ -116,6 +163,9 @@ class Router:
         if row is None:
             return None
         changes = patch.model_dump(exclude_none=True)
+        if "alias" in changes:
+            changes["alias"] = self._validate_alias(
+                changes["alias"], exclude_id=eid)
         if "base_url" in changes:
             changes["base_url"] = changes["base_url"].rstrip("/")
         if "enabled" in changes:
@@ -249,11 +299,13 @@ class Router:
         row = self.endpoints[eid]
         st = self.state[eid]
         return EndpointOut(
-            id=row["id"], name=row["name"], kind=row["kind"],
+            id=row["id"], name=row["name"], alias=row.get("alias"),
+            kind=row["kind"],
             server_type=row["server_type"], base_url=row["base_url"],
             has_key=bool(row["upstream_key"]), tunnel_id=row["tunnel_id"],
             priority=row["priority"], weight=row["weight"],
-            enabled=bool(row["enabled"]), model=st.model, health=st.health,
+            enabled=bool(row["enabled"]), model=st.model,
+            model_override=row.get("model_override"), health=st.health,
             ewma_latency_ms=(
                 round(st.ewma_latency_ms, 1) if st.ewma_latency_ms else None),
             last_ok_ts=st.last_ok_ts, consecutive_fails=st.consecutive_fails,

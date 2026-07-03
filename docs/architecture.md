@@ -27,6 +27,16 @@ state**. Hot-swapping an endpoint or failing one over is just mutating that
 state; in-flight requests are untouched and the next request picks up the
 change with no restart.
 
+Resolution order per request:
+1. **Model alias** — if the request's `model` matches an endpoint alias
+   (e.g. `"model": "skynet"`), route to that endpoint and rewrite `model`
+   to what that server actually runs (override or prober-discovered). No
+   failover — the caller named the server.
+2. **Manual pin** — the dashboard's active endpoint (hot-swap control).
+3. **Priority failover** — when the pin is failed (and auto-failover is on)
+   or the policy is `priority`, the healthy endpoint with the highest
+   priority wins; passive failures + probes move endpoints in and out.
+
 ```
                         ┌─────────────────────────────────────────────┐
   OpenAI SDK / curl ──▶ │  /v1/chat/completions  /v1/embeddings  ...  │

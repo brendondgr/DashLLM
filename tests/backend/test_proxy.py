@@ -4,9 +4,9 @@ capture, TTFT, stream_options injection, and pre-first-byte failover."""
 import time
 
 
-def _register(client, name, url, priority=100):
+def _register(client, name, url, priority=100, **extra):
     r = client.post("/admin/endpoints", json={
-        "name": name, "base_url": url, "priority": priority})
+        "name": name, "base_url": url, "priority": priority, **extra})
     assert r.status_code == 201, r.text
     return r.json()
 
@@ -81,12 +81,71 @@ def test_stream_usage_injection_can_be_disabled(proxy_env):
     assert row["completion_tokens"] == 6  # 5 deltas + [DONE] estimate
 
 
-def test_models_passthrough(proxy_env):
+def test_models_catalog_lists_auto_and_aliases(proxy_env):
     client, app, calls = proxy_env
-    _register(client, "good", "http://good/v1")
+    _register(client, "good", "http://good/v1", alias="skynet")
+    _register(client, "other", "http://good/v1", alias="local")
     r = client.get("/v1/models")
     assert r.status_code == 200
-    assert r.json()["data"][0]["id"] == "fake-model-7b"
+    ids = [m["id"] for m in r.json()["data"]]
+    assert ids[0] == "auto"
+    assert set(ids) == {"auto", "skynet", "local"}
+    skynet = next(m for m in r.json()["data"] if m["id"] == "skynet")
+    # prober discovered the real upstream model behind the alias
+    assert skynet["relay"]["upstream_model"] == "fake-model-7b"
+
+
+def test_alias_routing_rewrites_model(proxy_env):
+    client, app, calls = proxy_env
+    _register(client, "boring", "http://dead/v1", priority=500)  # pinned
+    _register(client, "skynet-box", "http://good/v1", priority=1,
+              alias="skynet")
+    # requesting model=skynet must bypass the pinned dead endpoint entirely
+    r = client.post("/v1/chat/completions", json={
+        "model": "skynet", "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 200
+    # the upstream received its real model name, not the alias
+    assert calls["last_model"] == "fake-model-7b"
+    row = _wait_rows(app, 1)[-1]
+    assert row["endpoint_name"] == "skynet-box"
+    assert row["model"] == "fake-model-7b"
+
+
+def test_alias_routing_respects_model_override(proxy_env):
+    client, app, calls = proxy_env
+    _register(client, "ov", "http://good/v1", alias="local",
+              model_override="my-exact-model")
+    r = client.post("/v1/chat/completions", json={
+        "model": "LOCAL",  # case-insensitive alias match
+        "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 200
+    assert calls["last_model"] == "my-exact-model"
+
+
+def test_alias_routing_does_not_fail_over(proxy_env):
+    client, app, calls = proxy_env
+    _register(client, "good", "http://good/v1", priority=500)
+    _register(client, "dead-named", "http://dead/v1", alias="skynet",
+              priority=1)
+    # the caller asked for skynet by name; a healthy sibling must NOT be
+    # silently substituted
+    r = client.post("/v1/chat/completions", json={
+        "model": "skynet", "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 502
+    assert calls["chat"] == 0
+    row = _wait_rows(app, 1)[-1]
+    assert row["endpoint_name"] == "dead-named" and row["ok"] == 0
+
+
+def test_duplicate_alias_rejected(proxy_env):
+    client, app, calls = proxy_env
+    _register(client, "a", "http://good/v1", alias="skynet")
+    r = client.post("/admin/endpoints", json={
+        "name": "b", "base_url": "http://good/v1", "alias": "SKYNET"})
+    assert r.status_code == 422
+    r = client.post("/admin/endpoints", json={
+        "name": "c", "base_url": "http://good/v1", "alias": "auto"})
+    assert r.status_code == 422
 
 
 def test_failover_before_first_byte(proxy_env):

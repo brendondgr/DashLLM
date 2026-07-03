@@ -14,6 +14,7 @@ RouterPolicy = Literal["manual", "priority"]
 class EndpointCreate(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     base_url: str = Field(min_length=1)
+    alias: str | None = Field(default=None, max_length=64)
     kind: EndpointKind | None = None  # inferred from URL when omitted
     server_type: ServerType = "openai"
     upstream_key: str | None = None
@@ -21,11 +22,13 @@ class EndpointCreate(BaseModel):
     priority: int = 100
     weight: int = 1
     enabled: bool = True
+    model_override: str | None = None  # model sent upstream for alias routes
 
 
 class EndpointPatch(BaseModel):
     name: str | None = None
     base_url: str | None = None
+    alias: str | None = None
     kind: EndpointKind | None = None
     server_type: ServerType | None = None
     upstream_key: str | None = None
@@ -33,11 +36,13 @@ class EndpointPatch(BaseModel):
     priority: int | None = None
     weight: int | None = None
     enabled: bool | None = None
+    model_override: str | None = None
 
 
 class EndpointOut(BaseModel):
     id: str
     name: str
+    alias: str | None = None
     kind: EndpointKind
     server_type: ServerType
     base_url: str
@@ -47,6 +52,7 @@ class EndpointOut(BaseModel):
     weight: int
     enabled: bool
     model: str | None = None
+    model_override: str | None = None
     health: Health = "unknown"
     ewma_latency_ms: float | None = None
     last_ok_ts: float | None = None
