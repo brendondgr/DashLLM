@@ -1,0 +1,30 @@
+[Unit]
+Description=vLLM SSH tunnel (skynet-alt -> localhost:9090)
+# Forwards local 127.0.0.1:9090 to the remote vLLM on skynet.coaps.fsu.edu.
+# Replaces the manual `ssh -L 127.0.0.1:9090:localhost:9090 skynet-alt` so the
+# tunnel comes back on boot. relay's "skynet" endpoint points at localhost:9090.
+After=network-online.target ssh-agent.service
+Wants=network-online.target
+# Cap restarts so an unreachable bastion can't spam the journal.
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# Reach the running user ssh-agent so the passphrase-unlocked key is available
+# (same pattern as the existing sshfs-*.service units).
+Environment=SSH_AUTH_SOCK=%t/ssh-agent.socket
+# -N: no remote shell. ExitOnForwardFailure: die (and restart) if the local
+# bind fails instead of silently running without a tunnel. BatchMode: never
+# hang waiting for a password. Host/user/key/ProxyJump come from ~/.ssh/config
+# (Host skynet-alt).
+ExecStart=/usr/bin/ssh -N \
+  -o ExitOnForwardFailure=yes \
+  -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
+  -o BatchMode=yes \
+  -L 127.0.0.1:9090:localhost:9090 skynet-alt
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=default.target
