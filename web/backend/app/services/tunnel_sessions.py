@@ -92,6 +92,60 @@ def validate_command(command: str) -> list[str]:
     return argv
 
 
+def _probe_argv(argv: list[str]) -> list[str]:
+    """Strip port-forwarding flags (``-N``, ``-L ...``) from an ssh argv and
+    add batch-mode options, so the route can be reachability-checked without
+    opening a tunnel or hanging on an interactive prompt."""
+    out = [argv[0], "-o", "BatchMode=yes", "-o", "ConnectTimeout=6"]
+    i = 1
+    while i < len(argv):
+        tok = argv[i]
+        if tok == "-N":
+            i += 1
+            continue
+        if tok == "-L":
+            i += 2
+            continue
+        if tok.startswith("-L") and len(tok) > 2:
+            i += 1
+            continue
+        out.append(tok)
+        i += 1
+    out.append("true")
+    return out
+
+
+async def probe_route(command: str, timeout: float = 8.0) -> dict:
+    """Quick non-interactive reachability check for a saved ssh route: no
+    PTY, no forwarded port held open. Fails fast rather than sitting on a
+    password prompt, so it can't be confused with a real connect."""
+    try:
+        argv = validate_command(command)
+    except ValueError as e:
+        return {"ok": False, "latency_ms": None, "error": str(e)}
+    probe_argv = _probe_argv(argv)
+    start = time.time()
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *probe_argv, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE)
+    except OSError as e:
+        return {"ok": False, "latency_ms": None, "error": str(e)}
+    try:
+        _, stderr = await asyncio.wait_for(proc.communicate(), timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        return {"ok": False, "latency_ms": None,
+                "error": f"timed out after {timeout:.0f}s (needs interactive input?)"}
+    latency_ms = round((time.time() - start) * 1000, 1)
+    if proc.returncode == 0:
+        return {"ok": True, "latency_ms": latency_ms, "error": None}
+    lines = [ln for ln in stderr.decode(errors="replace").splitlines() if ln.strip()]
+    return {"ok": False, "latency_ms": latency_ms,
+            "error": lines[-1] if lines else f"ssh exited ({proc.returncode})"}
+
+
 async def _port_open(port: int, timeout: float = 1.0) -> bool:
     try:
         _, writer = await asyncio.wait_for(

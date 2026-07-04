@@ -13,9 +13,14 @@ from app.schemas import (
     RouterState,
     RouterUpdate,
     TunnelRespond,
+    TunnelRouteCreate,
+    TunnelRouteOut,
+    TunnelRoutePatch,
+    TunnelRouteTestResult,
     TunnelSessionStatus,
 )
 from app.security import admin_guard
+from app.services.tunnel_sessions import probe_route
 
 log = get_logger("admin")
 
@@ -149,6 +154,71 @@ async def tunnel_respond(request: Request, eid: str, body: TunnelRespond):
 async def tunnel_status(request: Request, eid: str):
     _tunnel_endpoint(request, eid)
     return request.app.state.tunnel_sessions.status(eid)
+
+
+# ---- ssh tunnel routes (multiple candidate commands per endpoint) --------
+# An endpoint keeps one alias/base_url; each route is a saved ssh command
+# that can be activated (copied into tunnel_command) or quick-probed without
+# opening a real tunnel, so a flaky route can be swapped for a working one.
+
+@router.get("/endpoints/{eid}/routes", response_model=list[TunnelRouteOut])
+async def list_routes(request: Request, eid: str):
+    _tunnel_endpoint(request, eid)
+    return request.app.state.router.list_routes(eid)
+
+
+@router.post("/endpoints/{eid}/routes", response_model=TunnelRouteOut,
+             status_code=201)
+async def create_route(request: Request, eid: str, spec: TunnelRouteCreate):
+    _tunnel_endpoint(request, eid)
+    try:
+        return request.app.state.router.create_route(
+            eid, spec.label, spec.command)
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+
+
+@router.patch("/endpoints/{eid}/routes/{rid}", response_model=TunnelRouteOut)
+async def patch_route(request: Request, eid: str, rid: str,
+                       patch: TunnelRoutePatch):
+    _tunnel_endpoint(request, eid)
+    try:
+        row = request.app.state.router.patch_route(
+            eid, rid, patch.label, patch.command)
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+    if row is None:
+        raise HTTPException(404, "route not found")
+    return row
+
+
+@router.delete("/endpoints/{eid}/routes/{rid}", status_code=204)
+async def delete_route(request: Request, eid: str, rid: str):
+    _tunnel_endpoint(request, eid)
+    if not request.app.state.router.delete_route(eid, rid):
+        raise HTTPException(404, "route not found")
+
+
+@router.post("/endpoints/{eid}/routes/{rid}/activate",
+             response_model=EndpointOut)
+async def activate_route(request: Request, eid: str, rid: str):
+    _tunnel_endpoint(request, eid)
+    if request.app.state.router.activate_route(eid, rid) is None:
+        raise HTTPException(404, "route not found")
+    return request.app.state.router.out(eid)
+
+
+@router.post("/endpoints/{eid}/routes/{rid}/test",
+             response_model=TunnelRouteTestResult)
+async def test_route(request: Request, eid: str, rid: str):
+    _tunnel_endpoint(request, eid)
+    row = request.app.state.router.get_route(eid, rid)
+    if row is None:
+        raise HTTPException(404, "route not found")
+    result = await probe_route(row["command"])
+    log.info("tunnel route test", extra={"data": {
+        "endpoint": eid, "route": rid, **result}})
+    return result
 
 
 @router.get("/endpoints/health")

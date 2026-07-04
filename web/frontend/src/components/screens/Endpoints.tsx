@@ -1,6 +1,6 @@
 import React, { useState, useCallback, useEffect } from 'react';
 import type { CSSProperties } from 'react';
-import type { EndpointOut, EndpointTestResult, TunnelSessionStatus } from '../../lib/types';
+import type { EndpointOut, EndpointTestResult, TunnelRouteOut, TunnelSessionStatus } from '../../lib/types';
 import { C, ACCENT, MONO, SANS, dot, badge, statusColor } from '../../lib/styles';
 import { api } from '../../lib/api';
 import { log } from '../../lib/logger';
@@ -46,6 +46,20 @@ export default function Endpoints(props: EndpointsProps): React.JSX.Element {
   const [addOpen, setAddOpen] = useState(false);
   const [form, setForm] = useState({ name: '', type: 'llama.cpp', alias: '', url: '', key: '', tunnel: '' });
   const [tests, setTests] = useState<Record<string, TestEntry>>({});
+
+  // Editing an existing endpoint's name/type/alias/url/key inline.
+  const [editId, setEditId] = useState<string | null>(null);
+  const [editForm, setEditForm] = useState({ name: '', type: 'llama.cpp', alias: '', url: '', key: '' });
+
+  // Saved ssh routes (multiple candidate tunnel commands) per endpoint,
+  // fetched lazily when a card's "SSH routes" panel is opened.
+  const [routesOpenId, setRoutesOpenId] = useState<string | null>(null);
+  const [routes, setRoutes] = useState<Record<string, TunnelRouteOut[]>>({});
+  const [routeTests, setRouteTests] = useState<Record<string, TestState>>({});
+  const [routeTestMsg, setRouteTestMsg] = useState<Record<string, string>>({});
+  const [newRoute, setNewRoute] = useState({ label: '', command: '' });
+  const [editRouteId, setEditRouteId] = useState<string | null>(null);
+  const [editRouteForm, setEditRouteForm] = useState({ label: '', command: '' });
 
   // Live interactive tunnel-session state, keyed by endpoint id. Polled fast
   // while a prompt could be pending; nothing connects on its own.
@@ -129,6 +143,119 @@ export default function Endpoints(props: EndpointsProps): React.JSX.Element {
     } catch {
       setTests(t => ({ ...t, [id]: { state: 'fail', result: null } }));
       setTimeout(() => setTests(t => ({ ...t, [id]: { state: null, result: null } })), 3500);
+    }
+  }, []);
+
+  const startEdit = useCallback((e: EndpointOut) => {
+    setEditId(e.id);
+    setEditForm({ name: e.name, type: e.server_type, alias: e.alias ?? '', url: e.base_url, key: '' });
+  }, []);
+
+  const cancelEdit = useCallback(() => setEditId(null), []);
+
+  const saveEdit = useCallback(async () => {
+    if (!editId || !editForm.name || !editForm.url) return;
+    const patch: Record<string, unknown> = {
+      name: editForm.name,
+      base_url: editForm.url,
+      server_type: editForm.type,
+      alias: editForm.alias.trim() || null,
+    };
+    if (editForm.key.trim()) patch.upstream_key = editForm.key.trim();
+    try {
+      await api.patchEndpoint(editId, patch);
+      log.info('endpoints.edit', editId);
+      setEditId(null);
+      refresh();
+    } catch {
+      // api already logs errors
+    }
+  }, [editId, editForm, refresh]);
+
+  const loadRoutes = useCallback(async (eid: string) => {
+    try {
+      const list = await api.tunnelRoutes(eid);
+      setRoutes(r => ({ ...r, [eid]: list }));
+    } catch {
+      // api already logs errors
+    }
+  }, []);
+
+  const toggleRoutes = useCallback((eid: string) => {
+    setRoutesOpenId(id => {
+      const next = id === eid ? null : eid;
+      if (next) loadRoutes(next);
+      return next;
+    });
+    setNewRoute({ label: '', command: '' });
+    setEditRouteId(null);
+  }, [loadRoutes]);
+
+  const addRoute = useCallback(async (eid: string) => {
+    if (!newRoute.label.trim() || !newRoute.command.trim()) return;
+    try {
+      await api.createTunnelRoute(eid, { label: newRoute.label.trim(), command: newRoute.command.trim() });
+      log.info('endpoints.route.create', `${eid} ${newRoute.label}`);
+      setNewRoute({ label: '', command: '' });
+      loadRoutes(eid);
+    } catch {
+      // api already logs errors
+    }
+  }, [newRoute, loadRoutes]);
+
+  const startEditRoute = useCallback((r: TunnelRouteOut) => {
+    setEditRouteId(r.id);
+    setEditRouteForm({ label: r.label, command: r.command });
+  }, []);
+
+  const saveEditRoute = useCallback(async (eid: string) => {
+    if (!editRouteId || !editRouteForm.label.trim() || !editRouteForm.command.trim()) return;
+    try {
+      await api.patchTunnelRoute(eid, editRouteId, {
+        label: editRouteForm.label.trim(), command: editRouteForm.command.trim(),
+      });
+      log.info('endpoints.route.edit', editRouteId);
+      setEditRouteId(null);
+      loadRoutes(eid);
+    } catch {
+      // api already logs errors
+    }
+  }, [editRouteId, editRouteForm, loadRoutes]);
+
+  const deleteRoute = useCallback(async (eid: string, rid: string) => {
+    try {
+      await api.deleteTunnelRoute(eid, rid);
+      log.info('endpoints.route.delete', rid);
+      loadRoutes(eid);
+    } catch {
+      // api already logs errors
+    }
+  }, [loadRoutes]);
+
+  const activateRoute = useCallback(async (eid: string, rid: string) => {
+    try {
+      await api.activateTunnelRoute(eid, rid);
+      log.info('endpoints.route.activate', rid);
+      loadRoutes(eid);
+      refresh();
+    } catch {
+      // api already logs errors
+    }
+  }, [loadRoutes, refresh]);
+
+  const testRoute = useCallback(async (eid: string, rid: string) => {
+    setRouteTests(t => ({ ...t, [rid]: 'testing' }));
+    setRouteTestMsg(m => ({ ...m, [rid]: '' }));
+    log.info('endpoints.route.test', rid);
+    try {
+      const result = await api.testTunnelRoute(eid, rid);
+      setRouteTests(t => ({ ...t, [rid]: result.ok ? 'ok' : 'fail' }));
+      setRouteTestMsg(m => ({ ...m, [rid]: result.ok ? `reachable · ${result.latency_ms}ms` : (result.error ?? 'unreachable') }));
+    } catch {
+      setRouteTests(t => ({ ...t, [rid]: 'fail' }));
+      setRouteTestMsg(m => ({ ...m, [rid]: 'test failed' }));
+    } finally {
+      setTimeout(() => setRouteTests(t => ({ ...t, [rid]: null })), 5000);
     }
   }, []);
 
@@ -385,6 +512,38 @@ export default function Endpoints(props: EndpointsProps): React.JSX.Element {
               >
                 {testLabel}
               </div>
+              <div
+                onClick={() => (editId === e.id ? cancelEdit() : startEdit(e))}
+                style={{
+                  padding: '6px 12px',
+                  borderRadius: 6,
+                  border: `1px solid ${C.borderStrong}`,
+                  background: editId === e.id ? 'rgba(255,178,36,.10)' : C.bgInset,
+                  color: editId === e.id ? ACCENT : C.text,
+                  font: `500 11.5px ${SANS}`,
+                  cursor: 'pointer',
+                  userSelect: 'none',
+                  whiteSpace: 'nowrap',
+                }}
+              >
+                {editId === e.id ? 'Cancel edit' : 'Edit'}
+              </div>
+              <div
+                onClick={() => toggleRoutes(e.id)}
+                style={{
+                  padding: '6px 12px',
+                  borderRadius: 6,
+                  border: `1px solid ${C.borderStrong}`,
+                  background: routesOpenId === e.id ? 'rgba(88,166,255,.10)' : C.bgInset,
+                  color: routesOpenId === e.id ? C.cyan : C.text,
+                  font: `500 11.5px ${SANS}`,
+                  cursor: 'pointer',
+                  userSelect: 'none',
+                  whiteSpace: 'nowrap',
+                }}
+              >
+                SSH routes{routes[e.id] ? ` (${routes[e.id].length})` : ''}
+              </div>
               {hasTunnel && (
                 <div
                   onClick={() => (tunnelUp ? disconnectTunnel(e.id) : connectTunnel(e.id))}
@@ -446,6 +605,127 @@ export default function Endpoints(props: EndpointsProps): React.JSX.Element {
                 padding: '8px 12px',
               }}>
                 {tunnelMsg}
+              </div>
+            )}
+
+            {/* Edit endpoint */}
+            {editId === e.id && (
+              <div style={{
+                display: 'flex', flexDirection: 'column', gap: 10,
+                background: C.bg, border: `1px solid ${C.border}`, borderRadius: 6, padding: 12,
+              }}>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 130px 110px 1fr 1fr', gap: 10 }}>
+                  <input placeholder="name" value={editForm.name}
+                    onChange={(ev) => setEditForm(f => ({ ...f, name: ev.target.value }))} style={inputStyle} />
+                  <select value={editForm.type}
+                    onChange={(ev) => setEditForm(f => ({ ...f, type: ev.target.value }))} style={selectStyle}>
+                    <option value="llama.cpp">llama.cpp</option>
+                    <option value="vLLM">vLLM</option>
+                    <option value="ollama">ollama</option>
+                    <option value="openai">OpenAI-compat</option>
+                  </select>
+                  <input placeholder="alias (skynet)" value={editForm.alias}
+                    onChange={(ev) => setEditForm(f => ({ ...f, alias: ev.target.value }))} style={inputStyle} />
+                  <input placeholder="http://127.0.0.1:8000/v1" value={editForm.url}
+                    onChange={(ev) => setEditForm(f => ({ ...f, url: ev.target.value }))} style={inputStyle} />
+                  <input placeholder="api key (leave blank to keep)" value={editForm.key}
+                    onChange={(ev) => setEditForm(f => ({ ...f, key: ev.target.value }))} style={inputStyle} />
+                </div>
+                <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+                  <div onClick={cancelEdit} style={{
+                    padding: '6px 14px', borderRadius: 6, border: `1px solid ${C.borderStrong}`,
+                    color: C.textMut, font: `500 12px ${SANS}`, cursor: 'pointer',
+                  }}>Cancel</div>
+                  <div onClick={saveEdit} style={{
+                    padding: '6px 14px', borderRadius: 6, background: '#3FB950',
+                    color: '#0B0E14', font: `600 12px ${SANS}`, cursor: 'pointer',
+                  }}>Save changes</div>
+                </div>
+              </div>
+            )}
+
+            {/* SSH routes: multiple candidate tunnel commands for this endpoint. */}
+            {routesOpenId === e.id && (
+              <div style={{
+                display: 'flex', flexDirection: 'column', gap: 8,
+                background: C.bg, border: `1px solid ${C.border}`, borderRadius: 6, padding: 12,
+              }}>
+                <span style={{ font: `400 10.5px ${SANS}`, color: C.textDim }}>
+                  Save more than one ssh command for this endpoint (e.g. two hosts that reach the same server).
+                  <b style={{ color: C.textMut }}> Test</b> checks reachability without opening a tunnel;
+                  <b style={{ color: C.textMut }}> Use</b> makes it the command <b style={{ color: C.textMut }}>Connect</b> runs.
+                </span>
+                {(routes[e.id] ?? []).map(r => {
+                  const rts = routeTests[r.id] ?? null;
+                  const rMsg = routeTestMsg[r.id] ?? '';
+                  const rColor = rts === 'ok' ? C.green : rts === 'fail' ? C.red : C.textMut;
+                  if (editRouteId === r.id) {
+                    return (
+                      <div key={r.id} style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                        <input value={editRouteForm.label}
+                          onChange={(ev) => setEditRouteForm(f => ({ ...f, label: ev.target.value }))}
+                          style={{ ...inputStyle, width: 110 }} placeholder="label" />
+                        <input value={editRouteForm.command}
+                          onChange={(ev) => setEditRouteForm(f => ({ ...f, command: ev.target.value }))}
+                          style={{ ...inputStyle, flex: 1 }} placeholder="ssh -N -L ..." />
+                        <div onClick={() => saveEditRoute(e.id)} style={{
+                          padding: '5px 10px', borderRadius: 6, background: '#3FB950',
+                          color: '#0B0E14', font: `600 11px ${SANS}`, cursor: 'pointer', whiteSpace: 'nowrap',
+                        }}>Save</div>
+                        <div onClick={() => setEditRouteId(null)} style={{
+                          padding: '5px 10px', borderRadius: 6, border: `1px solid ${C.borderStrong}`,
+                          color: C.textMut, font: `500 11px ${SANS}`, cursor: 'pointer', whiteSpace: 'nowrap',
+                        }}>Cancel</div>
+                      </div>
+                    );
+                  }
+                  return (
+                    <div key={r.id} style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                      <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                        <span style={{ font: `600 11px ${SANS}`, color: C.text, minWidth: 70 }}>{r.label}</span>
+                        {r.active && <span style={badge(ACCENT)}>in use</span>}
+                        <span title={r.command} style={{
+                          font: `400 11px ${MONO}`, color: C.textMut, flex: 1, minWidth: 0,
+                          overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                        }}>{r.command}</span>
+                        <div onClick={() => testRoute(e.id, r.id)} style={{
+                          padding: '4px 10px', borderRadius: 6, border: `1px solid ${rColor}`,
+                          color: rColor, font: `500 11px ${SANS}`, cursor: 'pointer', whiteSpace: 'nowrap',
+                        }}>{rts === 'testing' ? '⟳ testing…' : rts === 'ok' ? '✓ reachable' : rts === 'fail' ? '✕ failed' : 'Test'}</div>
+                        {!r.active && (
+                          <div onClick={() => activateRoute(e.id, r.id)} style={{
+                            padding: '4px 10px', borderRadius: 6, border: `1px solid ${C.borderStrong}`,
+                            color: C.text, font: `500 11px ${SANS}`, cursor: 'pointer', whiteSpace: 'nowrap',
+                          }}>Use</div>
+                        )}
+                        <div onClick={() => startEditRoute(r)} style={{
+                          padding: '4px 10px', borderRadius: 6, border: `1px solid ${C.borderStrong}`,
+                          color: C.textMut, font: `500 11px ${SANS}`, cursor: 'pointer', whiteSpace: 'nowrap',
+                        }}>Edit</div>
+                        <div onClick={() => deleteRoute(e.id, r.id)} style={{
+                          padding: '4px 10px', borderRadius: 6, border: `1px solid ${C.borderStrong}`,
+                          color: C.red, font: `500 11px ${SANS}`, cursor: 'pointer', whiteSpace: 'nowrap',
+                        }}>Delete</div>
+                      </div>
+                      {rMsg && <span style={{ font: `400 10.5px ${MONO}`, color: rColor, paddingLeft: 78 }}>{rMsg}</span>}
+                    </div>
+                  );
+                })}
+                {(routes[e.id]?.length ?? 0) === 0 && (
+                  <span style={{ font: `400 11px ${SANS}`, color: C.textDim }}>No saved routes yet.</span>
+                )}
+                <div style={{ display: 'flex', gap: 8, alignItems: 'center', paddingTop: 4, borderTop: `1px solid ${C.border}` }}>
+                  <input placeholder="label (e.g. skynet-alt)" value={newRoute.label}
+                    onChange={(ev) => setNewRoute(f => ({ ...f, label: ev.target.value }))}
+                    style={{ ...inputStyle, width: 150 }} />
+                  <input placeholder="ssh -N -L 127.0.0.1:9090:localhost:9090 skynet-alt" value={newRoute.command}
+                    onChange={(ev) => setNewRoute(f => ({ ...f, command: ev.target.value }))}
+                    style={{ ...inputStyle, flex: 1 }} />
+                  <div onClick={() => addRoute(e.id)} style={{
+                    padding: '6px 12px', borderRadius: 6, background: ACCENT,
+                    color: '#0B0E14', font: `600 11.5px ${SANS}`, cursor: 'pointer', whiteSpace: 'nowrap',
+                  }}>+ Add route</div>
+                </div>
               </div>
             )}
           </div>

@@ -11,6 +11,8 @@ with the hot path. Async callers use the ``a*`` wrappers (thread offload).
 import asyncio
 import sqlite3
 import threading
+import time
+import uuid
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -64,6 +66,16 @@ CREATE TABLE IF NOT EXISTS endpoints (
   model_override TEXT,
   created_ts     REAL
 );
+
+CREATE TABLE IF NOT EXISTS tunnel_routes (
+  id            TEXT PRIMARY KEY,
+  endpoint_id   TEXT NOT NULL,
+  label         TEXT NOT NULL,
+  command       TEXT NOT NULL,
+  local_port    INTEGER,
+  created_ts    REAL
+);
+CREATE INDEX IF NOT EXISTS idx_tunnel_routes_ep ON tunnel_routes(endpoint_id);
 
 CREATE TABLE IF NOT EXISTS tunnels (
   id          TEXT PRIMARY KEY,
@@ -127,6 +139,32 @@ class Database:
         if "tunnel_local_port" not in cols:
             self._conn.execute(
                 "ALTER TABLE endpoints ADD COLUMN tunnel_local_port INTEGER")
+        if "active_tunnel_route_id" not in cols:
+            self._conn.execute(
+                "ALTER TABLE endpoints ADD COLUMN active_tunnel_route_id TEXT")
+        # Backfill: an endpoint that already had a tunnel_command before
+        # routes existed becomes its own "default" route, so upgrades don't
+        # lose the working ssh command.
+        orphans = self._conn.execute(
+            "SELECT id, tunnel_command, tunnel_local_port FROM endpoints"
+            " WHERE tunnel_command IS NOT NULL AND tunnel_command != ''"
+            " AND (active_tunnel_route_id IS NULL OR active_tunnel_route_id = '')"
+        ).fetchall()
+        for eid, cmd, port in orphans:
+            existing = self._conn.execute(
+                "SELECT id FROM tunnel_routes WHERE endpoint_id = ? LIMIT 1",
+                (eid,)).fetchone()
+            if existing:
+                rid = existing[0]
+            else:
+                rid = str(uuid.uuid4())
+                self._conn.execute(
+                    "INSERT INTO tunnel_routes (id, endpoint_id, label,"
+                    " command, local_port, created_ts) VALUES (?,?,?,?,?,?)",
+                    (rid, eid, "default", cmd, port, time.time()))
+            self._conn.execute(
+                "UPDATE endpoints SET active_tunnel_route_id = ? WHERE id = ?",
+                (rid, eid))
 
     # -- sync core -----------------------------------------------------
     def execute(self, sql: str, params: Iterable[Any] = ()) -> int:

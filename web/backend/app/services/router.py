@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from app.core.logging import get_logger
 from app.db import Database
 from app.schemas import EndpointCreate, EndpointOut, EndpointPatch, RouterState
+from app.services.tunnel_sessions import parse_local_port, validate_command
 
 log = get_logger("router")
 
@@ -203,6 +204,110 @@ class Router:
             self._persist_router()
         log.info("endpoint deleted", extra={"data": {"id": eid}})
         return True
+
+    # ---- tunnel routes (multiple ssh commands per endpoint) --------------
+    # An endpoint keeps its single alias/base_url; each saved route is just a
+    # candidate ssh command. Activating one copies it into the endpoint's
+    # tunnel_command/tunnel_local_port, which the existing interactive
+    # connect flow already reads — so hot-swapping the ssh path needs no
+    # changes to tunnel_sessions.py.
+    def _route_out(self, row: dict, eid: str) -> dict:
+        active_id = self.endpoints.get(eid, {}).get("active_tunnel_route_id")
+        return {**row, "active": row["id"] == active_id}
+
+    def list_routes(self, eid: str) -> list[dict]:
+        rows = self.db.query(
+            "SELECT * FROM tunnel_routes WHERE endpoint_id = ?"
+            " ORDER BY created_ts", (eid,))
+        return [self._route_out(r, eid) for r in rows]
+
+    def get_route(self, eid: str, rid: str) -> dict | None:
+        row = self.db.query_one(
+            "SELECT * FROM tunnel_routes WHERE id = ? AND endpoint_id = ?",
+            (rid, eid))
+        return self._route_out(row, eid) if row else None
+
+    def create_route(self, eid: str, label: str, command: str) -> dict:
+        if eid not in self.endpoints:
+            raise ValueError("endpoint not found")
+        validate_command(command)
+        rid = str(uuid.uuid4())
+        row = {
+            "id": rid, "endpoint_id": eid, "label": label.strip(),
+            "command": command.strip(),
+            "local_port": parse_local_port(command),
+            "created_ts": time.time(),
+        }
+        self.db.execute(
+            "INSERT INTO tunnel_routes (id, endpoint_id, label, command,"
+            " local_port, created_ts) VALUES (?,?,?,?,?,?)",
+            tuple(row.values()))
+        log.info("tunnel route created", extra={"data": {
+            "endpoint": eid, "route": rid, "label": row["label"]}})
+        return self._route_out(row, eid)
+
+    def patch_route(self, eid: str, rid: str, label: str | None,
+                    command: str | None) -> dict | None:
+        row = self.db.query_one(
+            "SELECT * FROM tunnel_routes WHERE id = ? AND endpoint_id = ?",
+            (rid, eid))
+        if row is None:
+            return None
+        if command is not None:
+            validate_command(command)
+            row["command"] = command.strip()
+            row["local_port"] = parse_local_port(command)
+        if label is not None:
+            row["label"] = label.strip()
+        self.db.execute(
+            "UPDATE tunnel_routes SET label = ?, command = ?, local_port = ?"
+            " WHERE id = ?",
+            (row["label"], row["command"], row["local_port"], rid))
+        if self.endpoints.get(eid, {}).get("active_tunnel_route_id") == rid:
+            self._apply_route_to_endpoint(eid, row)
+        log.info("tunnel route updated", extra={"data": {
+            "endpoint": eid, "route": rid}})
+        return self._route_out(row, eid)
+
+    def delete_route(self, eid: str, rid: str) -> bool:
+        n = self.db.execute(
+            "DELETE FROM tunnel_routes WHERE id = ? AND endpoint_id = ?",
+            (rid, eid))
+        if n and self.endpoints.get(eid, {}).get("active_tunnel_route_id") == rid:
+            row = self.endpoints[eid]
+            row["active_tunnel_route_id"] = None
+            self.db.execute(
+                "UPDATE endpoints SET active_tunnel_route_id = NULL"
+                " WHERE id = ?", (eid,))
+        log.info("tunnel route deleted", extra={"data": {
+            "endpoint": eid, "route": rid}})
+        return bool(n)
+
+    def _apply_route_to_endpoint(self, eid: str, route: dict) -> None:
+        row = self.endpoints[eid]
+        row["tunnel_command"] = route["command"]
+        row["tunnel_local_port"] = route["local_port"]
+        row["active_tunnel_route_id"] = route["id"]
+        row["kind"] = _infer_kind(
+            row["base_url"], row.get("tunnel_id"), row["tunnel_command"])
+        self.db.execute(
+            "UPDATE endpoints SET tunnel_command = ?, tunnel_local_port = ?,"
+            " active_tunnel_route_id = ?, kind = ? WHERE id = ?",
+            (row["tunnel_command"], row["tunnel_local_port"],
+             row["active_tunnel_route_id"], row["kind"], eid))
+
+    def activate_route(self, eid: str, rid: str) -> dict | None:
+        if eid not in self.endpoints:
+            return None
+        row = self.db.query_one(
+            "SELECT * FROM tunnel_routes WHERE id = ? AND endpoint_id = ?",
+            (rid, eid))
+        if row is None:
+            return None
+        self._apply_route_to_endpoint(eid, row)
+        log.info("tunnel route activated", extra={"data": {
+            "endpoint": eid, "route": rid, "label": row["label"]}})
+        return self.endpoints[eid]
 
     # ---- policy / hot-swap ---------------------------------------------------
     def activate(self, eid: str) -> bool:

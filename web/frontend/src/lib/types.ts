@@ -70,6 +70,25 @@ export interface TunnelSessionStatus {
   uptime_s: number;
 }
 
+/** A saved ssh command candidate for an endpoint's tunnel — lets a flaky
+ * route (e.g. "skynet-alt") be swapped for a working one without touching
+ * the endpoint's alias or base_url. */
+export interface TunnelRouteOut {
+  id: string;
+  endpoint_id: string;
+  label: string;
+  command: string;
+  local_port: number | null;
+  active: boolean;
+  created_ts: number | null;
+}
+
+export interface TunnelRouteTestResult {
+  ok: boolean;
+  latency_ms: number | null;
+  error: string | null;
+}
+
 export interface TunnelTestResult {
   ssh_ok: boolean;
   ssh_latency_ms: number | null;

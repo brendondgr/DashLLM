@@ -14,6 +14,8 @@ import type {
   StatsDataset,
   SummaryOut,
   TunnelOut,
+  TunnelRouteOut,
+  TunnelRouteTestResult,
   TunnelSessionStatus,
   TunnelTestResult,
 } from './types';
@@ -79,6 +81,20 @@ export const api = {
     req<TunnelSessionStatus>('POST', `/admin/endpoints/${id}/tunnel/disconnect`),
   respondEndpointTunnel: (id: string, text: string) =>
     req<TunnelSessionStatus>('POST', `/admin/endpoints/${id}/tunnel/respond`, { text }),
+
+  // ---- saved ssh tunnel routes (multiple candidate commands) ----------
+  tunnelRoutes: (eid: string) =>
+    get<TunnelRouteOut[]>(`/admin/endpoints/${eid}/routes`),
+  createTunnelRoute: (eid: string, body: { label: string; command: string }) =>
+    req<TunnelRouteOut>('POST', `/admin/endpoints/${eid}/routes`, body),
+  patchTunnelRoute: (eid: string, rid: string, body: Record<string, unknown>) =>
+    req<TunnelRouteOut>('PATCH', `/admin/endpoints/${eid}/routes/${rid}`, body),
+  deleteTunnelRoute: (eid: string, rid: string) =>
+    req<void>('DELETE', `/admin/endpoints/${eid}/routes/${rid}`),
+  activateTunnelRoute: (eid: string, rid: string) =>
+    req<EndpointOut>('POST', `/admin/endpoints/${eid}/routes/${rid}/activate`),
+  testTunnelRoute: (eid: string, rid: string) =>
+    req<TunnelRouteTestResult>('POST', `/admin/endpoints/${eid}/routes/${rid}/test`),
 
   // ---- tunnels --------------------------------------------------------
   tunnels: () => get<TunnelOut[]>('/admin/tunnels'),

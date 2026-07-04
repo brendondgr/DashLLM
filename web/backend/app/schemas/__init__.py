@@ -68,6 +68,32 @@ class EndpointOut(BaseModel):
     share: float = 0.0
 
 
+class TunnelRouteCreate(BaseModel):
+    label: str = Field(min_length=1, max_length=80)
+    command: str = Field(min_length=1)
+
+
+class TunnelRoutePatch(BaseModel):
+    label: str | None = None
+    command: str | None = None
+
+
+class TunnelRouteOut(BaseModel):
+    id: str
+    endpoint_id: str
+    label: str
+    command: str
+    local_port: int | None = None
+    active: bool = False
+    created_ts: float | None = None
+
+
+class TunnelRouteTestResult(BaseModel):
+    ok: bool
+    latency_ms: float | None = None
+    error: str | None = None
+
+
 class EndpointTestResult(BaseModel):
     ok: bool
     latency_ms: float | None = None
