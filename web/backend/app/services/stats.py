@@ -4,18 +4,31 @@ Every timeseries endpoint returns ``{dimensions: [...], source: [[...], ...]}``
 so the frontend does zero reshaping. Buckets are local-time (the dashboard's
 hour-of-day and per-day charts are local-time concepts), zero-filled across
 the window so category axes stay dense.
+
+Scale strategy: hour-aligned windows (24h/7d/30d/all/custom) read from the
+pre-aggregated ``request_rollup_hourly`` / ``request_rollup_hist`` tables, so
+query cost is O(hours) instead of O(requests) and stays flat as the raw table
+grows into the millions. The 1h window (minute buckets) and short-window
+percentiles still read raw rows, which are bounded and cheap. Percentiles are
+therefore *hybrid*: exact from raw for spans <= 24h, approximate from summed
+histograms for wider spans (see ``services/histogram.py``).
 """
 
 import time
 from math import ceil, floor
 
 from app.db import Database
+from app.services.histogram import percentile_from_hist
 from app.services.telemetry import LiveTracker
 
 _WINDOWS = {"1h": 3600, "24h": 86400, "7d": 7 * 86400, "30d": 30 * 86400}
 _MINUTE_FMT = "%Y-%m-%dT%H:%M"
 _HOUR_FMT = "%Y-%m-%dT%H:00"
 _DAY_FMT = "%Y-%m-%d"
+
+# Percentiles are computed exactly (from raw rows) for spans up to this width,
+# and approximately (from histograms) beyond it. 24h + a minute of slack.
+_EXACT_PCT_SPAN = 86400 + 60
 
 
 def _percentile(values: list[float], pct: float) -> float | None:
@@ -73,6 +86,26 @@ class StatsService:
         return (" WHERE " + " AND ".join(clauses)) if clauses else "", params
 
     @staticmethod
+    def _roll_where(endpoint_id: str | None, model: str | None,
+                    start: float, end: float) -> tuple[str, list]:
+        """WHERE clause against the rollup tables (bucket_hour range + filters).
+        NULL endpoint/model are stored as '' in rollups, so filters match."""
+        clauses = ["bucket_hour >= ?", "bucket_hour <= ?"]
+        params: list = [int(start // 3600) * 3600, end]
+        if endpoint_id:
+            clauses.append("endpoint_id = ?")
+            params.append(endpoint_id)
+        if model:
+            clauses.append("model = ?")
+            params.append(model)
+        return " WHERE " + " AND ".join(clauses), params
+
+    @staticmethod
+    def _use_rollup(step: int) -> bool:
+        """Rollups are hourly; only the minute-bucketed 1h window needs raw."""
+        return step == 3600
+
+    @staticmethod
     def _fill(start: float, end: float, step: int, fmt: str) -> list[str]:
         keys = []
         t = floor(start / step) * step
@@ -84,6 +117,7 @@ class StatsService:
     async def _bucketed(self, select: str, start: float, end: float,
                         step: int, fmt: str, where: str, params: list,
                         n_values: int) -> dict[str, list]:
+        """Raw-table time series (used for the 1h/minute window)."""
         sql = (
             f"SELECT strftime('{fmt}', ts, 'unixepoch', 'localtime') AS bucket,"
             f" {select} FROM requests{where} GROUP BY bucket ORDER BY bucket"
@@ -98,25 +132,88 @@ class StatsService:
                 else [0] * n_values)
         return out
 
+    async def _roll_bucketed(self, select: str, start: float, end: float,
+                             step: int, fmt: str, where: str, params: list,
+                             n_values: int) -> dict[str, list]:
+        """Rollup-table time series (hourly windows). Labels are formatted in
+        Python from the integer ``bucket_hour`` epoch."""
+        sql = (
+            f"SELECT bucket_hour, {select} FROM request_rollup_hourly{where}"
+            " GROUP BY bucket_hour ORDER BY bucket_hour"
+        )
+        rows = await self.db.aquery(sql, params)
+        by_key: dict[str, list] = {}
+        for r in rows:
+            key = time.strftime(fmt, time.localtime(r["bucket_hour"]))
+            by_key[key] = [r[f"v{i}"] or 0 for i in range(n_values)]
+        return {key: by_key.get(key, [0] * n_values)
+                for key in self._fill(start, end, step, fmt)}
+
+    # ---- percentile sources ----------------------------------------------
+    async def _hist_counts(self, metrics: tuple[str, ...], where: str,
+                           params: list) -> dict[str, dict[int, int]]:
+        """Sum histogram bucket counts over a range -> {metric: {idx: count}}."""
+        placeholders = ",".join("?" for _ in metrics)
+        rows = await self.db.aquery(
+            "SELECT metric, bucket_idx, SUM(count) AS c FROM request_rollup_hist"
+            f"{where} AND metric IN ({placeholders})"
+            " GROUP BY metric, bucket_idx",
+            [*params, *metrics])
+        out: dict[str, dict[int, int]] = {m: {} for m in metrics}
+        for r in rows:
+            out[r["metric"]][r["bucket_idx"]] = r["c"]
+        return out
+
     # ---- endpoints ---------------------------------------------------------
     async def summary(self, window: str | None, from_ts=None, to_ts=None,
                       endpoint_id=None, model=None) -> dict:
-        start, end, _, _ = self._range(window, from_ts, to_ts)
-        where, params = self._filters(endpoint_id, model, start, end)
-        agg = await self.db.aquery_one(
-            "SELECT COUNT(*) AS requests,"
-            " SUM(CASE WHEN ok = 0 THEN 1 ELSE 0 END) AS errors,"
-            " COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,"
-            " COALESCE(SUM(completion_tokens), 0) AS completion_tokens,"
-            " COALESCE(SUM(total_tokens), 0) AS total_tokens,"
-            " COALESCE(SUM(cost_usd), 0) AS cost_usd"
-            f" FROM requests{where}", params)
-        samples = await self.db.aquery(
-            "SELECT ttft_ms, latency_ms, tokens_per_sec"
-            f" FROM requests{where}", params)
-        ttfts = [r["ttft_ms"] for r in samples if r["ttft_ms"]]
-        lats = [r["latency_ms"] for r in samples if r["latency_ms"]]
-        tpss = [r["tokens_per_sec"] for r in samples if r["tokens_per_sec"]]
+        start, end, step, _ = self._range(window, from_ts, to_ts)
+        exact = (end - start) <= _EXACT_PCT_SPAN
+
+        if self._use_rollup(step):
+            where, params = self._roll_where(endpoint_id, model, start, end)
+            agg = await self.db.aquery_one(
+                "SELECT COALESCE(SUM(n),0) AS requests,"
+                " COALESCE(SUM(errors),0) AS errors,"
+                " COALESCE(SUM(prompt_tokens),0) AS prompt_tokens,"
+                " COALESCE(SUM(completion_tokens),0) AS completion_tokens,"
+                " COALESCE(SUM(total_tokens),0) AS total_tokens,"
+                " COALESCE(SUM(cost_usd),0) AS cost_usd,"
+                " COALESCE(SUM(tps_sum),0) AS tps_sum,"
+                " COALESCE(SUM(tps_n),0) AS tps_n"
+                f" FROM request_rollup_hourly{where}", params)
+        else:
+            rwhere, rparams = self._filters(endpoint_id, model, start, end)
+            agg = await self.db.aquery_one(
+                "SELECT COUNT(*) AS requests,"
+                " SUM(CASE WHEN ok = 0 THEN 1 ELSE 0 END) AS errors,"
+                " COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,"
+                " COALESCE(SUM(completion_tokens), 0) AS completion_tokens,"
+                " COALESCE(SUM(total_tokens), 0) AS total_tokens,"
+                " COALESCE(SUM(cost_usd), 0) AS cost_usd"
+                f" FROM requests{rwhere}", rparams)
+
+        if exact:
+            rwhere, rparams = self._filters(endpoint_id, model, start, end)
+            samples = await self.db.aquery(
+                "SELECT ttft_ms, latency_ms, tokens_per_sec"
+                f" FROM requests{rwhere}", rparams)
+            ttfts = [r["ttft_ms"] for r in samples if r["ttft_ms"]]
+            lats = [r["latency_ms"] for r in samples if r["latency_ms"]]
+            tpss = [r["tokens_per_sec"] for r in samples if r["tokens_per_sec"]]
+            ttft = {"p50": _percentile(ttfts, 50), "p95": _percentile(ttfts, 95)}
+            lat = {"p50": _percentile(lats, 50), "p95": _percentile(lats, 95)}
+            tps = {"p50": _percentile(tpss, 50)}
+        else:
+            where, params = self._roll_where(endpoint_id, model, start, end)
+            counts = await self._hist_counts(
+                ("ttft", "latency", "tps"), where, params)
+            ttft = {"p50": percentile_from_hist("ttft", counts["ttft"], 50),
+                    "p95": percentile_from_hist("ttft", counts["ttft"], 95)}
+            lat = {"p50": percentile_from_hist("latency", counts["latency"], 50),
+                   "p95": percentile_from_hist("latency", counts["latency"], 95)}
+            tps = {"p50": percentile_from_hist("tps", counts["tps"], 50)}
+
         requests = agg["requests"] or 0
         errors = agg["errors"] or 0
         return {
@@ -127,20 +224,24 @@ class StatsService:
             "completion_tokens": agg["completion_tokens"],
             "total_tokens": agg["total_tokens"],
             "cost_usd": round(agg["cost_usd"] or 0, 4),
-            "ttft_ms": {"p50": _percentile(ttfts, 50),
-                        "p95": _percentile(ttfts, 95)},
-            "latency_ms": {"p50": _percentile(lats, 50),
-                           "p95": _percentile(lats, 95)},
-            "tokens_per_sec": {"p50": _percentile(tpss, 50)},
+            "ttft_ms": ttft,
+            "latency_ms": lat,
+            "tokens_per_sec": tps,
         }
 
     async def volume(self, window, from_ts=None, to_ts=None,
                      endpoint_id=None, model=None) -> dict:
         start, end, step, fmt = self._range(window, from_ts, to_ts)
-        where, params = self._filters(endpoint_id, model, start, end)
-        buckets = await self._bucketed(
-            "COUNT(*) AS v0, SUM(CASE WHEN ok = 0 THEN 1 ELSE 0 END) AS v1",
-            start, end, step, fmt, where, params, 2)
+        if self._use_rollup(step):
+            where, params = self._roll_where(endpoint_id, model, start, end)
+            buckets = await self._roll_bucketed(
+                "SUM(n) AS v0, SUM(errors) AS v1",
+                start, end, step, fmt, where, params, 2)
+        else:
+            where, params = self._filters(endpoint_id, model, start, end)
+            buckets = await self._bucketed(
+                "COUNT(*) AS v0, SUM(CASE WHEN ok = 0 THEN 1 ELSE 0 END) AS v1",
+                start, end, step, fmt, where, params, 2)
         return {
             "dimensions": ["time", "requests", "errors"],
             "source": [[k, *v] for k, v in buckets.items()],
@@ -149,11 +250,17 @@ class StatsService:
     async def tokens_timeseries(self, window, from_ts=None, to_ts=None,
                                 endpoint_id=None, model=None) -> dict:
         start, end, step, fmt = self._range(window, from_ts, to_ts)
-        where, params = self._filters(endpoint_id, model, start, end)
-        buckets = await self._bucketed(
-            "COALESCE(SUM(prompt_tokens), 0) AS v0,"
-            " COALESCE(SUM(completion_tokens), 0) AS v1",
-            start, end, step, fmt, where, params, 2)
+        if self._use_rollup(step):
+            where, params = self._roll_where(endpoint_id, model, start, end)
+            buckets = await self._roll_bucketed(
+                "SUM(prompt_tokens) AS v0, SUM(completion_tokens) AS v1",
+                start, end, step, fmt, where, params, 2)
+        else:
+            where, params = self._filters(endpoint_id, model, start, end)
+            buckets = await self._bucketed(
+                "COALESCE(SUM(prompt_tokens), 0) AS v0,"
+                " COALESCE(SUM(completion_tokens), 0) AS v1",
+                start, end, step, fmt, where, params, 2)
         return {
             "dimensions": ["time", "input", "output"],
             "source": [[k, *v] for k, v in buckets.items()],
@@ -161,50 +268,81 @@ class StatsService:
 
     async def tokens_by_hour(self, window, from_ts=None, to_ts=None,
                              endpoint_id=None, model=None) -> dict:
-        start, end, _, _ = self._range(window or "30d", from_ts, to_ts)
-        where, params = self._filters(endpoint_id, model, start, end)
-        rows = await self.db.aquery(
-            "SELECT CAST(strftime('%H', ts, 'unixepoch', 'localtime') AS INTEGER)"
-            " AS hour, COALESCE(SUM(prompt_tokens), 0) AS tin,"
-            " COALESCE(SUM(completion_tokens), 0) AS tout"
-            f" FROM requests{where} GROUP BY hour", params)
+        start, end, step, _ = self._range(window or "30d", from_ts, to_ts)
+        if self._use_rollup(step):
+            where, params = self._roll_where(endpoint_id, model, start, end)
+            rows = await self.db.aquery(
+                "SELECT CAST(strftime('%H', bucket_hour, 'unixepoch',"
+                " 'localtime') AS INTEGER) AS hour,"
+                " SUM(prompt_tokens) AS tin, SUM(completion_tokens) AS tout"
+                f" FROM request_rollup_hourly{where} GROUP BY hour", params)
+        else:
+            where, params = self._filters(endpoint_id, model, start, end)
+            rows = await self.db.aquery(
+                "SELECT CAST(strftime('%H', ts, 'unixepoch', 'localtime') AS"
+                " INTEGER) AS hour, COALESCE(SUM(prompt_tokens), 0) AS tin,"
+                " COALESCE(SUM(completion_tokens), 0) AS tout"
+                f" FROM requests{where} GROUP BY hour", params)
         by_hour = {r["hour"]: r for r in rows}
         source = [
-            [h, (by_hour.get(h) or {}).get("tin", 0),
-             (by_hour.get(h) or {}).get("tout", 0)]
+            [h, (by_hour.get(h) or {}).get("tin", 0) or 0,
+             (by_hour.get(h) or {}).get("tout", 0) or 0]
             for h in range(24)
         ]
         return {"dimensions": ["hour", "input", "output"], "source": source}
 
     async def tokens_by_day(self, window, from_ts=None, to_ts=None,
                             endpoint_id=None, model=None) -> dict:
-        start, end, _, _ = self._range(window or "7d", from_ts, to_ts)
-        where, params = self._filters(endpoint_id, model, start, end)
-        rows = await self.db.aquery(
-            f"SELECT strftime('{_DAY_FMT}', ts, 'unixepoch', 'localtime')"
-            " AS day, COALESCE(SUM(prompt_tokens), 0) AS tin,"
-            " COALESCE(SUM(completion_tokens), 0) AS tout"
-            f" FROM requests{where} GROUP BY day ORDER BY day", params)
+        start, end, step, _ = self._range(window or "7d", from_ts, to_ts)
+        if self._use_rollup(step):
+            where, params = self._roll_where(endpoint_id, model, start, end)
+            rows = await self.db.aquery(
+                f"SELECT strftime('{_DAY_FMT}', bucket_hour, 'unixepoch',"
+                " 'localtime') AS day, SUM(prompt_tokens) AS tin,"
+                " SUM(completion_tokens) AS tout"
+                f" FROM request_rollup_hourly{where} GROUP BY day"
+                " ORDER BY day", params)
+        else:
+            where, params = self._filters(endpoint_id, model, start, end)
+            rows = await self.db.aquery(
+                f"SELECT strftime('{_DAY_FMT}', ts, 'unixepoch', 'localtime')"
+                " AS day, COALESCE(SUM(prompt_tokens), 0) AS tin,"
+                " COALESCE(SUM(completion_tokens), 0) AS tout"
+                f" FROM requests{where} GROUP BY day ORDER BY day", params)
         by_day = {r["day"]: r for r in rows}
         source = [
-            [d, (by_day.get(d) or {}).get("tin", 0),
-             (by_day.get(d) or {}).get("tout", 0)]
+            [d, (by_day.get(d) or {}).get("tin", 0) or 0,
+             (by_day.get(d) or {}).get("tout", 0) or 0]
             for d in self._fill(start, end, 86400, _DAY_FMT)
         ]
         return {"dimensions": ["date", "input", "output"], "source": source}
 
     async def by_model(self, window, from_ts=None, to_ts=None,
                        endpoint_id=None, model=None) -> dict:
-        start, end, _, _ = self._range(window, from_ts, to_ts)
-        where, params = self._filters(endpoint_id, model, start, end)
-        rows = await self.db.aquery(
-            "SELECT COALESCE(model, '—') AS model, COUNT(*) AS requests,"
-            " COALESCE(SUM(total_tokens), 0) AS tokens,"
-            " COALESCE(SUM(cost_usd), 0) AS cost,"
-            " ROUND(AVG(tokens_per_sec), 1) AS avg_tps,"
-            " SUM(CASE WHEN ok = 0 THEN 1 ELSE 0 END) AS errors"
-            f" FROM requests{where} GROUP BY model ORDER BY requests DESC",
-            params)
+        start, end, step, _ = self._range(window, from_ts, to_ts)
+        if self._use_rollup(step):
+            where, params = self._roll_where(endpoint_id, model, start, end)
+            rows = await self.db.aquery(
+                "SELECT CASE WHEN model = '' THEN '—' ELSE model END AS model,"
+                " SUM(n) AS requests, SUM(total_tokens) AS tokens,"
+                " SUM(cost_usd) AS cost, SUM(tps_sum) AS tps_sum,"
+                " SUM(tps_n) AS tps_n, SUM(errors) AS errors"
+                f" FROM request_rollup_hourly{where} GROUP BY model"
+                " ORDER BY requests DESC", params)
+            rows = [
+                {**r, "avg_tps": round(r["tps_sum"] / r["tps_n"], 1)
+                 if r["tps_n"] else 0}
+                for r in rows]
+        else:
+            where, params = self._filters(endpoint_id, model, start, end)
+            rows = await self.db.aquery(
+                "SELECT COALESCE(model, '—') AS model, COUNT(*) AS requests,"
+                " COALESCE(SUM(total_tokens), 0) AS tokens,"
+                " COALESCE(SUM(cost_usd), 0) AS cost,"
+                " ROUND(AVG(tokens_per_sec), 1) AS avg_tps,"
+                " SUM(CASE WHEN ok = 0 THEN 1 ELSE 0 END) AS errors"
+                f" FROM requests{where} GROUP BY model ORDER BY requests DESC",
+                params)
         return {
             "dimensions": ["model", "requests", "tokens", "cost",
                            "avg_tps", "errors"],
@@ -215,16 +353,27 @@ class StatsService:
 
     async def by_endpoint(self, window, from_ts=None, to_ts=None,
                           endpoint_id=None, model=None) -> dict:
-        start, end, _, _ = self._range(window, from_ts, to_ts)
-        where, params = self._filters(endpoint_id, model, start, end)
-        rows = await self.db.aquery(
-            "SELECT COALESCE(endpoint_name, '—') AS endpoint,"
-            " endpoint_id, COUNT(*) AS requests,"
-            " COALESCE(SUM(prompt_tokens), 0) AS input,"
-            " COALESCE(SUM(completion_tokens), 0) AS output,"
-            " SUM(CASE WHEN ok = 0 THEN 1 ELSE 0 END) AS errors"
-            f" FROM requests{where} GROUP BY endpoint_id"
-            " ORDER BY requests DESC", params)
+        start, end, step, _ = self._range(window, from_ts, to_ts)
+        if self._use_rollup(step):
+            where, params = self._roll_where(endpoint_id, model, start, end)
+            rows = await self.db.aquery(
+                "SELECT COALESCE(MAX(endpoint_name), '—') AS endpoint,"
+                " CASE WHEN endpoint_id = '' THEN NULL ELSE endpoint_id END"
+                " AS endpoint_id, SUM(n) AS requests,"
+                " SUM(prompt_tokens) AS input, SUM(completion_tokens) AS output,"
+                " SUM(errors) AS errors"
+                f" FROM request_rollup_hourly{where} GROUP BY endpoint_id"
+                " ORDER BY requests DESC", params)
+        else:
+            where, params = self._filters(endpoint_id, model, start, end)
+            rows = await self.db.aquery(
+                "SELECT COALESCE(endpoint_name, '—') AS endpoint,"
+                " endpoint_id, COUNT(*) AS requests,"
+                " COALESCE(SUM(prompt_tokens), 0) AS input,"
+                " COALESCE(SUM(completion_tokens), 0) AS output,"
+                " SUM(CASE WHEN ok = 0 THEN 1 ELSE 0 END) AS errors"
+                f" FROM requests{where} GROUP BY endpoint_id"
+                " ORDER BY requests DESC", params)
         total = sum(r["requests"] for r in rows) or 1
         return {
             "dimensions": ["endpoint", "requests", "input", "output",
@@ -237,26 +386,50 @@ class StatsService:
     async def latency(self, window, from_ts=None, to_ts=None,
                       endpoint_id=None, model=None) -> dict:
         start, end, step, fmt = self._range(window, from_ts, to_ts)
-        where, params = self._filters(endpoint_id, model, start, end)
-        rows = await self.db.aquery(
-            f"SELECT strftime('{fmt}', ts, 'unixepoch', 'localtime') AS bucket,"
-            " ttft_ms, tokens_per_sec FROM requests" + where, params)
-        grouped: dict[str, dict[str, list]] = {}
-        for r in rows:
-            g = grouped.setdefault(r["bucket"], {"ttft": [], "tps": []})
-            if r["ttft_ms"]:
-                g["ttft"].append(r["ttft_ms"])
-            if r["tokens_per_sec"]:
-                g["tps"].append(r["tokens_per_sec"])
-        source = []
-        for key in self._fill(start, end, step, fmt):
-            g = grouped.get(key, {"ttft": [], "tps": []})
-            source.append([
-                key,
-                _percentile(g["ttft"], 50) or 0,
-                _percentile(g["ttft"], 95) or 0,
-                _percentile(g["tps"], 50) or 0,
-            ])
+        keys = self._fill(start, end, step, fmt)
+        if (end - start) <= _EXACT_PCT_SPAN:
+            where, params = self._filters(endpoint_id, model, start, end)
+            rows = await self.db.aquery(
+                f"SELECT strftime('{fmt}', ts, 'unixepoch', 'localtime') AS"
+                " bucket, ttft_ms, tokens_per_sec FROM requests" + where, params)
+            grouped: dict[str, dict[str, list]] = {}
+            for r in rows:
+                g = grouped.setdefault(r["bucket"], {"ttft": [], "tps": []})
+                if r["ttft_ms"]:
+                    g["ttft"].append(r["ttft_ms"])
+                if r["tokens_per_sec"]:
+                    g["tps"].append(r["tokens_per_sec"])
+            source = []
+            for key in keys:
+                g = grouped.get(key, {"ttft": [], "tps": []})
+                source.append([
+                    key,
+                    _percentile(g["ttft"], 50) or 0,
+                    _percentile(g["ttft"], 95) or 0,
+                    _percentile(g["tps"], 50) or 0,
+                ])
+        else:
+            # Approximate per-hour percentiles from summed histograms.
+            where, params = self._roll_where(endpoint_id, model, start, end)
+            rows = await self.db.aquery(
+                "SELECT bucket_hour, metric, bucket_idx, SUM(count) AS c"
+                f" FROM request_rollup_hist{where}"
+                " AND metric IN ('ttft','tps')"
+                " GROUP BY bucket_hour, metric, bucket_idx", params)
+            grouped: dict[str, dict[str, dict[int, int]]] = {}
+            for r in rows:
+                key = time.strftime(fmt, time.localtime(r["bucket_hour"]))
+                g = grouped.setdefault(key, {"ttft": {}, "tps": {}})
+                g[r["metric"]][r["bucket_idx"]] = r["c"]
+            source = []
+            for key in keys:
+                g = grouped.get(key, {"ttft": {}, "tps": {}})
+                source.append([
+                    key,
+                    percentile_from_hist("ttft", g["ttft"], 50) or 0,
+                    percentile_from_hist("ttft", g["ttft"], 95) or 0,
+                    percentile_from_hist("tps", g["tps"], 50) or 0,
+                ])
         return {
             "dimensions": ["time", "ttft_p50", "ttft_p95", "tps_p50"],
             "source": source,

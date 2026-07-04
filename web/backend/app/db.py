@@ -43,10 +43,12 @@ CREATE INDEX IF NOT EXISTS idx_requests_ts    ON requests(ts);
 CREATE INDEX IF NOT EXISTS idx_requests_model ON requests(model);
 CREATE INDEX IF NOT EXISTS idx_requests_ep    ON requests(endpoint_id);
 
+-- prompt/completion are zlib-compressed BLOBs (see telemetry.body_pack);
+-- legacy rows may still hold plain TEXT and are handled by body_unpack.
 CREATE TABLE IF NOT EXISTS request_bodies (
   id         TEXT PRIMARY KEY,
-  prompt     TEXT,
-  completion TEXT
+  prompt     BLOB,
+  completion BLOB
 );
 
 CREATE TABLE IF NOT EXISTS endpoints (
@@ -93,6 +95,42 @@ CREATE TABLE IF NOT EXISTS tunnels (
   enabled     INTEGER NOT NULL DEFAULT 0,
   created_ts  REAL
 );
+
+-- Hourly pre-aggregation so the dashboard never scans the raw requests table.
+-- endpoint_id/model use '' (not NULL) so the composite PK dedupes under UPSERT.
+CREATE TABLE IF NOT EXISTS request_rollup_hourly (
+  bucket_hour       INTEGER NOT NULL,
+  endpoint_id       TEXT NOT NULL DEFAULT '',
+  model             TEXT NOT NULL DEFAULT '',
+  n                 INTEGER NOT NULL DEFAULT 0,
+  errors            INTEGER NOT NULL DEFAULT 0,
+  prompt_tokens     INTEGER NOT NULL DEFAULT 0,
+  completion_tokens INTEGER NOT NULL DEFAULT 0,
+  total_tokens      INTEGER NOT NULL DEFAULT 0,
+  cost_usd          REAL    NOT NULL DEFAULT 0,
+  tps_sum           REAL    NOT NULL DEFAULT 0,
+  tps_n             INTEGER NOT NULL DEFAULT 0,
+  endpoint_name     TEXT,
+  PRIMARY KEY (bucket_hour, endpoint_id, model)
+);
+CREATE INDEX IF NOT EXISTS idx_rollup_hourly_h ON request_rollup_hourly(bucket_hour);
+
+-- Additive per-hour latency/ttft/tps histograms for approximate percentiles on
+-- wide windows (see services/histogram.py). Only non-zero buckets are stored.
+CREATE TABLE IF NOT EXISTS request_rollup_hist (
+  bucket_hour  INTEGER NOT NULL,
+  endpoint_id  TEXT NOT NULL DEFAULT '',
+  model        TEXT NOT NULL DEFAULT '',
+  metric       TEXT NOT NULL,
+  bucket_idx   INTEGER NOT NULL,
+  count        INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (bucket_hour, endpoint_id, model, metric, bucket_idx)
+);
+CREATE INDEX IF NOT EXISTS idx_rollup_hist_h ON request_rollup_hist(bucket_hour);
+-- Covering index for the wide-window percentile scan (GROUP BY metric,bucket_idx
+-- with a bucket_hour range): lets SQLite aggregate index-only, no table lookup.
+CREATE INDEX IF NOT EXISTS idx_rollup_hist_scan
+  ON request_rollup_hist(metric, bucket_idx, bucket_hour, count);
 
 CREATE TABLE IF NOT EXISTS settings (
   key   TEXT PRIMARY KEY,
@@ -165,6 +203,49 @@ class Database:
             self._conn.execute(
                 "UPDATE endpoints SET active_tunnel_route_id = ? WHERE id = ?",
                 (rid, eid))
+
+        self._rollup_backfill()
+
+    def _rollup_backfill(self) -> None:
+        """Populate rollup tables from pre-existing raw rows exactly once.
+
+        Runs during __init__ before the telemetry writer starts, so it can't
+        race with live inserts (which maintain rollups incrementally from here
+        on). Guarded by a settings watermark; idempotent across restarts.
+        """
+        # Local import avoids a db <-> telemetry/rollup import cycle.
+        from app.services.rollup import (
+            HIST_UPSERT, SUM_UPSERT, build_rollup_rows,
+        )
+
+        done = self._conn.execute(
+            "SELECT value FROM settings WHERE key = 'rollup_built'"
+        ).fetchone()
+        if done and done[0] == "1":
+            return
+
+        cur = self._conn.execute(
+            "SELECT ts, endpoint_id, model, ok, prompt_tokens,"
+            " completion_tokens, total_tokens, cost_usd, ttft_ms, latency_ms,"
+            " tokens_per_sec, endpoint_name FROM requests")
+        cols = [d[0] for d in cur.description]
+        total = 0
+        while True:
+            chunk = cur.fetchmany(5000)
+            if not chunk:
+                break
+            items = [dict(zip(cols, row)) for row in chunk]
+            sum_rows, hist_rows = build_rollup_rows(items)
+            if sum_rows:
+                self._conn.executemany(SUM_UPSERT, sum_rows)
+            if hist_rows:
+                self._conn.executemany(HIST_UPSERT, hist_rows)
+            total += len(items)
+
+        self._conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES"
+            " ('rollup_built', '1')")
+        # commit happens in __init__ after _migrate returns.
 
     # -- sync core -----------------------------------------------------
     def execute(self, sql: str, params: Iterable[Any] = ()) -> int:

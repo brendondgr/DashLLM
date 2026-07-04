@@ -9,16 +9,47 @@
 
 import asyncio
 import time
+import zlib
 from collections import deque
 
 from pydantic import BaseModel
 
 from app.core.logging import get_logger
 from app.db import Database
+from app.services.rollup import HIST_UPSERT, SUM_UPSERT, build_rollup_rows
 
 log = get_logger("telemetry")
 
 _STOP = object()
+
+# Request bodies (prompts/completions) are natural-language / JSON text that
+# compresses ~3-5x. We store them zlib-deflated as BLOBs so "log bodies" +
+# infinite retention stays affordable. Reads go through ``body_unpack`` which
+# is backward compatible with pre-compression rows stored as plain TEXT.
+_ZLIB_MAGIC = 0x78  # first byte of a zlib stream (CMF, window<=32K, level 6)
+
+
+def body_pack(text: str | None) -> bytes | None:
+    if text is None:
+        return None
+    return zlib.compress(text.encode("utf-8"), 6)
+
+
+def body_unpack(value) -> str | None:
+    """Inverse of :func:`body_pack`. Tolerates legacy uncompressed TEXT rows
+    and already-decoded ``str`` values so it is safe on any historical row."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (bytes, bytearray)):
+        if len(value) and value[0] == _ZLIB_MAGIC:
+            try:
+                return zlib.decompress(value).decode("utf-8")
+            except zlib.error:
+                pass  # not actually zlib -> fall through and decode as-is
+        return bytes(value).decode("utf-8", "replace")
+    return str(value)
 
 
 class RequestRecord(BaseModel):
@@ -125,12 +156,13 @@ class TelemetryWriter:
         try:
             await self.db.aexecutemany(_INSERT, [_row(r) for r in batch])
             bodies = [
-                (r.id, r.prompt_body, r.completion_body)
+                (r.id, body_pack(r.prompt_body), body_pack(r.completion_body))
                 for r in batch
                 if r.prompt_body is not None or r.completion_body is not None
             ]
             if bodies:
                 await self.db.aexecutemany(_INSERT_BODY, bodies)
+            await self._roll_up(batch)
             self.written += len(batch)
             for r in batch:
                 log.debug("recorded request", extra={"data": {
@@ -143,8 +175,33 @@ class TelemetryWriter:
             log.exception("telemetry write failed",
                           extra={"data": {"batch": len(batch)}})
 
+    async def _roll_up(self, batch: list[RequestRecord]) -> None:
+        """Fold this batch into the hourly rollup tables (same additive UPSERTs
+        the backfill uses). Keeps dashboard queries O(buckets), not O(rows)."""
+        items = [{
+            "ts": r.ts, "endpoint_id": r.endpoint_id, "model": r.model,
+            "ok": r.ok, "prompt_tokens": r.prompt_tokens,
+            "completion_tokens": r.completion_tokens,
+            "total_tokens": r.total_tokens, "cost_usd": r.cost_usd,
+            "ttft_ms": r.ttft_ms, "latency_ms": r.latency_ms,
+            "tokens_per_sec": r.tokens_per_sec,
+            "endpoint_name": r.endpoint_name,
+        } for r in batch]
+        sum_rows, hist_rows = build_rollup_rows(items)
+        if sum_rows:
+            await self.db.aexecutemany(SUM_UPSERT, sum_rows)
+        if hist_rows:
+            await self.db.aexecutemany(HIST_UPSERT, hist_rows)
+
     async def prune(self, retention_days: int) -> int:
-        """Delete rows past retention. Called periodically from the app."""
+        """Delete raw rows past retention. Called periodically from the app.
+
+        ``retention_days <= 0`` means "keep forever": nothing is deleted. The
+        hourly rollup tables are never pruned regardless, so aggregate history
+        (dashboard charts) survives even when a finite raw retention is set."""
+        if retention_days <= 0:
+            self._last_prune = time.time()
+            return 0
         cutoff = time.time() - retention_days * 86400
         n = await self.db.aexecute("DELETE FROM requests WHERE ts < ?", (cutoff,))
         await self.db.aexecute(

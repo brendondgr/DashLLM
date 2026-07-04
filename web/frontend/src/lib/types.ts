@@ -118,6 +118,7 @@ export interface ProxyInfoOut {
   uptime_s: number;
   requests_total: number;
   active_clients: number;
+  db_size_bytes: number;
 }
 
 export interface RequestRow {

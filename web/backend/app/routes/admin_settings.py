@@ -26,6 +26,18 @@ async def put_settings(request: Request, patch: SettingsPatch):
     return request.app.state.settings.update(patch)
 
 
+def _db_size_bytes(db_path) -> int:
+    """On-disk footprint = main db + WAL + shared-memory index."""
+    from pathlib import Path
+    base = Path(db_path)
+    total = 0
+    for suffix in ("", "-wal", "-shm"):
+        p = base.with_name(base.name + suffix)
+        if p.exists():
+            total += p.stat().st_size
+    return total
+
+
 @router.get("/proxy")
 async def proxy_info(request: Request):
     st = request.app.state.settings
@@ -40,6 +52,7 @@ async def proxy_info(request: Request):
         "uptime_s": round(st.uptime_s(), 1),
         "requests_total": (row["n"] if row else 0) + len(live.in_flight),
         "active_clients": live.active_clients(),
+        "db_size_bytes": _db_size_bytes(request.app.state.cfg.db_path),
     }
 
 
