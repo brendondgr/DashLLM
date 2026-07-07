@@ -21,10 +21,26 @@ from app.db import Database
 from app.services.histogram import percentile_from_hist
 from app.services.telemetry import LiveTracker
 
-_WINDOWS = {"1h": 3600, "24h": 86400, "7d": 7 * 86400, "30d": 30 * 86400}
+_WINDOWS = {"1h": 3600, "24h": 86400, "7d": 7 * 86400, "30d": 30 * 86400,
+            "1y": 365 * 86400}
 _MINUTE_FMT = "%Y-%m-%dT%H:%M"
 _HOUR_FMT = "%Y-%m-%dT%H:00"
 _DAY_FMT = "%Y-%m-%d"
+
+# Time-series tick granularity for the combined volume/tokens chart, keyed by
+# (window, detail). "summary" gives coarse at-a-glance buckets; "detailed"
+# subdivides each window. Units coarser than an hour aggregate the hourly
+# rollups; finer units (minute, 15min) scan raw rows.
+_TS_BUCKETS = {
+    ("1h", "summary"): "minute",   ("1h", "detailed"): "minute",
+    ("24h", "summary"): "hour",    ("24h", "detailed"): "15min",
+    ("7d", "summary"): "day",      ("7d", "detailed"): "hour",
+    ("30d", "summary"): "day",     ("30d", "detailed"): "3hour",
+    ("1y", "summary"): "month",    ("1y", "detailed"): "day",
+}
+_UNIT_STEP = {"minute": 60, "15min": 900, "hour": 3600,
+              "3hour": 10800, "day": 86400}
+_ROLLUP_UNITS = {"hour", "3hour", "day", "month"}
 
 # Percentiles are computed exactly (from raw rows) for spans up to this width,
 # and approximately (from histograms) beyond it. 24h + a minute of slack.
@@ -114,40 +130,110 @@ class StatsService:
             t += step
         return keys
 
-    async def _bucketed(self, select: str, start: float, end: float,
-                        step: int, fmt: str, where: str, params: list,
-                        n_values: int) -> dict[str, list]:
-        """Raw-table time series (used for the 1h/minute window)."""
-        sql = (
-            f"SELECT strftime('{fmt}', ts, 'unixepoch', 'localtime') AS bucket,"
-            f" {select} FROM requests{where} GROUP BY bucket ORDER BY bucket"
-        )
-        rows = await self.db.aquery(sql, params)
-        by_key = {r["bucket"]: r for r in rows}
-        out: dict[str, list] = {}
-        for key in self._fill(start, end, step, fmt):
-            row = by_key.get(key)
-            out[key] = (
-                [row[f"v{i}"] or 0 for i in range(n_values)] if row
-                else [0] * n_values)
-        return out
+    # ---- combined-chart timeseries bucketing ------------------------------
+    def _ts_range(self, window: str | None, detail: str | None,
+                  from_ts: float | None,
+                  to_ts: float | None) -> tuple[float, float, str]:
+        """-> (start, end, unit) for the volume / tokens timeseries."""
+        now = time.time()
+        if from_ts is not None:
+            return from_ts, (to_ts or now), "hour"
+        w = window or "24h"
+        if w == "all":
+            row = self.db.query_one("SELECT MIN(ts) AS t FROM requests")
+            start = row["t"] if row and row["t"] else now - 86400
+            return start, now, "day"
+        d = detail if detail in ("summary", "detailed") else "summary"
+        unit = _TS_BUCKETS.get((w, d), "hour")
+        return now - _WINDOWS.get(w, 86400), now, unit
 
-    async def _roll_bucketed(self, select: str, start: float, end: float,
-                             step: int, fmt: str, where: str, params: list,
-                             n_values: int) -> dict[str, list]:
-        """Rollup-table time series (hourly windows). Labels are formatted in
-        Python from the integer ``bucket_hour`` epoch."""
-        sql = (
-            f"SELECT bucket_hour, {select} FROM request_rollup_hourly{where}"
-            " GROUP BY bucket_hour ORDER BY bucket_hour"
-        )
-        rows = await self.db.aquery(sql, params)
-        by_key: dict[str, list] = {}
-        for r in rows:
-            key = time.strftime(fmt, time.localtime(r["bucket_hour"]))
-            by_key[key] = [r[f"v{i}"] or 0 for i in range(n_values)]
-        return {key: by_key.get(key, [0] * n_values)
-                for key in self._fill(start, end, step, fmt)}
+    @staticmethod
+    def _bucket_key(ts: float, unit: str) -> str:
+        """Canonical local-time bucket label for ``ts`` at ``unit``. Matches
+        the SQL expression in :meth:`_raw_bucket_expr` exactly."""
+        lt = time.localtime(ts)
+        if unit == "minute":
+            return time.strftime("%Y-%m-%dT%H:%M", lt)
+        if unit == "15min":
+            return (time.strftime("%Y-%m-%dT%H:", lt)
+                    + f"{(lt.tm_min // 15) * 15:02d}")
+        if unit == "hour":
+            return time.strftime("%Y-%m-%dT%H:00", lt)
+        if unit == "3hour":
+            return (time.strftime("%Y-%m-%dT", lt)
+                    + f"{(lt.tm_hour // 3) * 3:02d}:00")
+        if unit == "day":
+            return time.strftime("%Y-%m-%d", lt)
+        if unit == "month":
+            return time.strftime("%Y-%m", lt)
+        raise ValueError(f"unknown bucket unit: {unit}")
+
+    @staticmethod
+    def _raw_bucket_expr(unit: str) -> str:
+        """SQLite expression that emits the same key as :meth:`_bucket_key`."""
+        lt = "ts, 'unixepoch', 'localtime'"
+        if unit == "minute":
+            return f"strftime('%Y-%m-%dT%H:%M', {lt})"
+        if unit == "15min":
+            return (f"strftime('%Y-%m-%dT%H:', {lt}) || printf('%02d',"
+                    f" (CAST(strftime('%M', {lt}) AS INTEGER) / 15) * 15)")
+        if unit == "hour":
+            return f"strftime('%Y-%m-%dT%H:00', {lt})"
+        if unit == "day":
+            return f"strftime('%Y-%m-%d', {lt})"
+        raise ValueError(f"unit {unit} has no raw expression")
+
+    @staticmethod
+    def _fill_unit(start: float, end: float, unit: str) -> list[str]:
+        """Dense, ordered bucket keys spanning [start, end] at ``unit``."""
+        if unit == "month":
+            s, e = time.localtime(start), time.localtime(end)
+            keys, y, m = [], s.tm_year, s.tm_mon
+            while (y, m) <= (e.tm_year, e.tm_mon):
+                keys.append(f"{y:04d}-{m:02d}")
+                m += 1
+                if m > 12:
+                    m, y = 1, y + 1
+            return keys
+        step = _UNIT_STEP[unit]
+        keys: list[str] = []
+        t = floor(start / step) * step
+        while t <= end:
+            key = StatsService._bucket_key(t, unit)
+            if not keys or keys[-1] != key:
+                keys.append(key)
+            t += step
+        return keys
+
+    async def _ts_agg(self, unit: str, start: float, end: float,
+                      endpoint_id: str | None, model: str | None,
+                      roll_select: str, raw_select: str,
+                      n_values: int) -> dict[str, list]:
+        """Zero-filled timeseries summed into ``unit`` buckets. Rollup source
+        for hour-and-coarser units, raw rows for sub-hour units."""
+        acc = {k: [0] * n_values for k in self._fill_unit(start, end, unit)}
+        if unit in _ROLLUP_UNITS:
+            where, params = self._roll_where(endpoint_id, model, start, end)
+            rows = await self.db.aquery(
+                f"SELECT bucket_hour, {roll_select} FROM request_rollup_hourly"
+                f"{where} GROUP BY bucket_hour", params)
+            for r in rows:
+                key = self._bucket_key(r["bucket_hour"], unit)
+                if key in acc:
+                    for i in range(n_values):
+                        acc[key][i] += r[f"v{i}"] or 0
+        else:
+            where, params = self._filters(endpoint_id, model, start, end)
+            expr = self._raw_bucket_expr(unit)
+            rows = await self.db.aquery(
+                f"SELECT {expr} AS bucket, {raw_select} FROM requests"
+                f"{where} GROUP BY bucket", params)
+            for r in rows:
+                key = r["bucket"]
+                if key in acc:
+                    for i in range(n_values):
+                        acc[key][i] += r[f"v{i}"] or 0
+        return acc
 
     # ---- percentile sources ----------------------------------------------
     async def _hist_counts(self, metrics: tuple[str, ...], where: str,
@@ -230,37 +316,26 @@ class StatsService:
         }
 
     async def volume(self, window, from_ts=None, to_ts=None,
-                     endpoint_id=None, model=None) -> dict:
-        start, end, step, fmt = self._range(window, from_ts, to_ts)
-        if self._use_rollup(step):
-            where, params = self._roll_where(endpoint_id, model, start, end)
-            buckets = await self._roll_bucketed(
-                "SUM(n) AS v0, SUM(errors) AS v1",
-                start, end, step, fmt, where, params, 2)
-        else:
-            where, params = self._filters(endpoint_id, model, start, end)
-            buckets = await self._bucketed(
-                "COUNT(*) AS v0, SUM(CASE WHEN ok = 0 THEN 1 ELSE 0 END) AS v1",
-                start, end, step, fmt, where, params, 2)
+                     endpoint_id=None, model=None, detail="summary") -> dict:
+        start, end, unit = self._ts_range(window, detail, from_ts, to_ts)
+        buckets = await self._ts_agg(
+            unit, start, end, endpoint_id, model,
+            "SUM(n) AS v0, SUM(errors) AS v1",
+            "COUNT(*) AS v0, SUM(CASE WHEN ok = 0 THEN 1 ELSE 0 END) AS v1", 2)
         return {
             "dimensions": ["time", "requests", "errors"],
             "source": [[k, *v] for k, v in buckets.items()],
         }
 
     async def tokens_timeseries(self, window, from_ts=None, to_ts=None,
-                                endpoint_id=None, model=None) -> dict:
-        start, end, step, fmt = self._range(window, from_ts, to_ts)
-        if self._use_rollup(step):
-            where, params = self._roll_where(endpoint_id, model, start, end)
-            buckets = await self._roll_bucketed(
-                "SUM(prompt_tokens) AS v0, SUM(completion_tokens) AS v1",
-                start, end, step, fmt, where, params, 2)
-        else:
-            where, params = self._filters(endpoint_id, model, start, end)
-            buckets = await self._bucketed(
-                "COALESCE(SUM(prompt_tokens), 0) AS v0,"
-                " COALESCE(SUM(completion_tokens), 0) AS v1",
-                start, end, step, fmt, where, params, 2)
+                                endpoint_id=None, model=None,
+                                detail="summary") -> dict:
+        start, end, unit = self._ts_range(window, detail, from_ts, to_ts)
+        buckets = await self._ts_agg(
+            unit, start, end, endpoint_id, model,
+            "SUM(prompt_tokens) AS v0, SUM(completion_tokens) AS v1",
+            "COALESCE(SUM(prompt_tokens), 0) AS v0,"
+            " COALESCE(SUM(completion_tokens), 0) AS v1", 2)
         return {
             "dimensions": ["time", "input", "output"],
             "source": [[k, *v] for k, v in buckets.items()],

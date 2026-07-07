@@ -10,17 +10,25 @@ export const fmt = (n: number | null | undefined): string => {
     : String(Math.round(n));
 };
 
-/** Bucket key "2026-07-03T14:00" -> range-appropriate axis label. */
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+  'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+/** Bucket key -> axis label. Keys arrive shaped by the backend bucket unit:
+ * "2026-07" (month), "2026-07-03" (day), "2026-07-03T14:00" / ":15" (time).
+ * The label detail scales with the selected range. */
 export const fmtBucket = (bucket: string, range: RangeId): string => {
+  // month bucket: "2026-07"
+  if (/^\d{4}-\d{2}$/.test(bucket)) {
+    const [y, m] = bucket.split('-');
+    return `${MONTHS[Number(m) - 1]} '${y!.slice(2)}`;
+  }
   const [datePart, timePart] = bucket.split('T');
   if (!datePart) return bucket;
   const [, m, d] = datePart.split('-');
-  const hhmm = timePart ?? '';
-  if (range === '1h') return hhmm;
-  if (range === '24h') return hhmm;
   const md = `${Number(m)}/${Number(d)}`;
-  if (range === '7d') return `${md} ${Number(hhmm.slice(0, 2))}h`;
-  return md;
+  if (!timePart) return md;                    // day bucket "YYYY-MM-DD"
+  if (range === '1h' || range === '24h') return timePart;  // within a day
+  return `${md} ${Number(timePart.slice(0, 2))}h`;         // day + hour
 };
 
 /** "2026-07-01" -> "07/01" (daily chart axis, prototype style). */

@@ -196,7 +196,9 @@ export interface RouterState {
 }
 
 /** Dashboard time range selection. */
-export type RangeId = '1h' | '24h' | '7d' | '30d' | 'custom';
+export type RangeId = '1h' | '24h' | '7d' | '30d' | '1y' | 'custom';
+/** Tick granularity for the combined volume/tokens chart. */
+export type DetailLevel = 'summary' | 'detailed';
 export interface RangeSel {
   id: RangeId;
   /** unix seconds, only for custom */

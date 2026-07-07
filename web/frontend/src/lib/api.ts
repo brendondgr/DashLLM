@@ -3,6 +3,7 @@
 
 import { log } from './logger';
 import type {
+  DetailLevel,
   EndpointOut,
   EndpointTestResult,
   LiveSnapshot,
@@ -136,9 +137,11 @@ export const api = {
 
   // ---- stats ---------------------------------------------------------------
   summary: (r: RangeSel) => get<SummaryOut>(`/admin/stats/summary?${rangeQuery(r)}`),
-  volume: (r: RangeSel) => get<StatsDataset>(`/admin/stats/volume?${rangeQuery(r)}`),
-  tokensTimeseries: (r: RangeSel) =>
-    get<StatsDataset>(`/admin/stats/tokens/timeseries?${rangeQuery(r)}`),
+  volume: (r: RangeSel, detail: DetailLevel = 'summary') =>
+    get<StatsDataset>(`/admin/stats/volume?${rangeQuery(r)}&detail=${detail}`),
+  tokensTimeseries: (r: RangeSel, detail: DetailLevel = 'summary') =>
+    get<StatsDataset>(
+      `/admin/stats/tokens/timeseries?${rangeQuery(r)}&detail=${detail}`),
   tokensByHour: (r: RangeSel) =>
     get<StatsDataset>(`/admin/stats/tokens/by-hour?${rangeQuery(r)}`),
   tokensByDay: (r: RangeSel) =>
