@@ -23,7 +23,7 @@ import type {
 } from '../../lib/types';
 import EChart from '../EChart';
 
-type LayoutId = 'A' | 'B' | 'C';
+type LayoutId = 'A' | 'C';
 
 interface Props {
   live: LiveSnapshot | null;
@@ -38,7 +38,7 @@ const DETAILS: [DetailLevel, string][] = [
   ['summary', 'Summary'], ['detailed', 'Detailed'],
 ];
 const LAYOUTS: [LayoutId, string][] = [
-  ['A', 'Overview'], ['B', 'Timeline'], ['C', 'Dense'],
+  ['A', 'Overview'], ['C', 'Dense'],
 ];
 
 /** Panel grids per layout: [span, height, order?]. The combined volume+tokens
@@ -46,8 +46,6 @@ const LAYOUTS: [LayoutId, string][] = [
 const PANELS: Record<LayoutId, Record<string, number[]>> = {
   A: { combo: [8, 300], conc: [4, 300], hod: [4, 250],
        daily: [4, 250], break: [4, 250] },
-  B: { combo: [8, 340, 1], conc: [4, 340, 2], daily: [8, 240, 3],
-       hod: [4, 240, 4], break: [12, 220, 5] },
   C: { combo: [6, 240, 1], conc: [6, 240, 2], hod: [4, 220, 3],
        daily: [4, 220, 4], break: [4, 220, 5] },
 };
