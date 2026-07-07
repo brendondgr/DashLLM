@@ -2,7 +2,14 @@
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
-from app.schemas import TunnelCreate, TunnelOut, TunnelPatch, TunnelTestResult
+from app.schemas import (
+    TunnelCreate,
+    TunnelOut,
+    TunnelPatch,
+    TunnelRespond,
+    TunnelSessionStatus,
+    TunnelTestResult,
+)
 from app.security import admin_guard
 from app.services.tunnels import command_string
 
@@ -10,6 +17,11 @@ router = APIRouter(
     prefix="/admin/tunnels", tags=["tunnels"],
     dependencies=[Depends(admin_guard)]
 )
+
+
+def _session_key(tid: str) -> str:
+    """Namespace tunnel-id session keys apart from endpoint-id ones."""
+    return f"t:{tid}"
 
 
 @router.get("", response_model=list[TunnelOut])
@@ -76,3 +88,48 @@ async def tunnel_command(request: Request, tid: str):
         return {"command": command_string(row)}
     except ValueError as e:
         raise HTTPException(422, str(e))
+
+
+# ---- interactive PTY session ----------------------------------------------
+# Run this tunnel's exact ssh command in a real pseudo-terminal so the SSH
+# Tunnel tab can show live output and answer prompts (host key / passphrase /
+# password). Reuses the endpoint TunnelSessionManager, keyed by t:<tid>.
+
+def _tunnel_row(request: Request, tid: str) -> dict:
+    row = request.app.state.tunnels.row(tid)
+    if row is None:
+        raise HTTPException(404, "tunnel not found")
+    return row
+
+
+@router.get("/{tid}/session", response_model=TunnelSessionStatus)
+async def tunnel_session_status(request: Request, tid: str):
+    _tunnel_row(request, tid)
+    return request.app.state.tunnel_sessions.status(_session_key(tid))
+
+
+@router.post("/{tid}/session/connect", response_model=TunnelSessionStatus)
+async def tunnel_session_connect(request: Request, tid: str):
+    row = _tunnel_row(request, tid)
+    try:
+        command = command_string(row)
+        return await request.app.state.tunnel_sessions.connect(
+            _session_key(tid), command, row["local_port"])
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+
+
+@router.post("/{tid}/session/disconnect", response_model=TunnelSessionStatus)
+async def tunnel_session_disconnect(request: Request, tid: str):
+    _tunnel_row(request, tid)
+    return await request.app.state.tunnel_sessions.disconnect(_session_key(tid))
+
+
+@router.post("/{tid}/session/respond", response_model=TunnelSessionStatus)
+async def tunnel_session_respond(request: Request, tid: str, body: TunnelRespond):
+    _tunnel_row(request, tid)
+    out = await request.app.state.tunnel_sessions.respond(
+        _session_key(tid), body.text)
+    if out is None:
+        raise HTTPException(409, "no active session awaiting input")
+    return out

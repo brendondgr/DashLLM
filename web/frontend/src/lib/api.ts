@@ -11,6 +11,7 @@ import type {
   RecentResponse,
   RouterState,
   RuntimeSettings,
+  SshHostOut,
   StatsDataset,
   SummaryOut,
   TunnelOut,
@@ -70,6 +71,11 @@ export const api = {
   testEndpoint: (id: string) =>
     req<EndpointTestResult>('POST', `/admin/endpoints/${id}/test`),
 
+  // ---- ssh config hosts (~/.ssh/config, resolved via ssh -G) -----------
+  sshHosts: () => get<SshHostOut[]>('/admin/ssh/hosts'),
+  sshResolve: (host: string) =>
+    get<SshHostOut>(`/admin/ssh/resolve?host=${encodeURIComponent(host)}`),
+
   // ---- interactive per-endpoint SSH tunnel sessions --------------------
   tunnelSessions: () =>
     get<TunnelSessionStatus[]>('/admin/endpoints/tunnel-sessions'),
@@ -109,6 +115,16 @@ export const api = {
     req<TunnelTestResult>('POST', `/admin/tunnels/${id}/test`),
   tunnelCommand: (id: string) =>
     get<{ command: string }>(`/admin/tunnels/${id}/command`),
+
+  // ---- interactive PTY session for a structured tunnel (SSH Tunnel tab) --
+  tunnelSession: (id: string) =>
+    get<TunnelSessionStatus>(`/admin/tunnels/${id}/session`),
+  connectTunnelSession: (id: string) =>
+    req<TunnelSessionStatus>('POST', `/admin/tunnels/${id}/session/connect`),
+  disconnectTunnelSession: (id: string) =>
+    req<TunnelSessionStatus>('POST', `/admin/tunnels/${id}/session/disconnect`),
+  respondTunnelSession: (id: string, text: string) =>
+    req<TunnelSessionStatus>('POST', `/admin/tunnels/${id}/session/respond`, { text }),
 
   // ---- settings / proxy -------------------------------------------------
   settings: () => get<RuntimeSettings>('/admin/settings'),

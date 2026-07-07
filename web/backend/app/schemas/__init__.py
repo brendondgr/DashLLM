@@ -94,6 +94,19 @@ class TunnelRouteTestResult(BaseModel):
     error: str | None = None
 
 
+# ---- ssh config hosts ------------------------------------------------
+class SshHostOut(BaseModel):
+    """A ``~/.ssh/config`` alias resolved via ``ssh -G`` to its real settings."""
+    alias: str
+    hostname: str | None = None
+    user: str | None = None
+    port: int = 22
+    identity_files: list[str] = []
+    identity_file: str | None = None   # the effective one (explicit if any)
+    identity_explicit: bool = False    # a specific key vs. default fan-out
+    proxyjump: str | None = None
+
+
 class EndpointTestResult(BaseModel):
     ok: bool
     latency_ms: float | None = None

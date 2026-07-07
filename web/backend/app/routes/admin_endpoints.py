@@ -12,6 +12,7 @@ from app.schemas import (
     EndpointTestResult,
     RouterState,
     RouterUpdate,
+    SshHostOut,
     TunnelRespond,
     TunnelRouteCreate,
     TunnelRouteOut,
@@ -20,6 +21,7 @@ from app.schemas import (
     TunnelSessionStatus,
 )
 from app.security import admin_guard
+from app.services import ssh_config
 from app.services.tunnel_sessions import probe_route
 
 log = get_logger("admin")
@@ -219,6 +221,24 @@ async def test_route(request: Request, eid: str, rid: str):
     log.info("tunnel route test", extra={"data": {
         "endpoint": eid, "route": rid, **result}})
     return result
+
+
+# ---- ssh config hosts ------------------------------------------------------
+# Read the user's ~/.ssh/config so shorthand tunnel commands (e.g.
+# `ssh -N -L 9090:localhost:9090 skynet-alt`) can be built from real aliases,
+# and so the UI shows the actual IdentityFile ssh will use — not a guess.
+
+@router.get("/ssh/hosts", response_model=list[SshHostOut])
+async def ssh_hosts(request: Request):
+    return await ssh_config.list_hosts()
+
+
+@router.get("/ssh/resolve", response_model=SshHostOut)
+async def ssh_resolve(request: Request, host: str):
+    try:
+        return await ssh_config.resolve(host)
+    except ValueError as e:
+        raise HTTPException(422, str(e))
 
 
 @router.get("/endpoints/health")

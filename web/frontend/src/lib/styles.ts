@@ -67,6 +67,9 @@ export const input: CSSProperties = {
   background: C.bgSidebar, border: `1px solid ${C.borderStrong}`,
   borderRadius: 6, color: C.text, padding: '7px 10px',
   font: `400 12px ${MONO}`, outline: 'none',
+  // Without border-box + width:100%, an <input>'s intrinsic size overflows
+  // its grid/flex cell (the "Local Port" field spilling out of its column).
+  boxSizing: 'border-box', width: '100%', minWidth: 0,
 };
 
 export const card: CSSProperties = {

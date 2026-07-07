@@ -1,6 +1,6 @@
 import React, { useState, useCallback, useEffect } from 'react';
 import type { CSSProperties } from 'react';
-import type { EndpointOut, EndpointTestResult, TunnelRouteOut, TunnelSessionStatus } from '../../lib/types';
+import type { EndpointOut, EndpointTestResult, SshHostOut, TunnelRouteOut, TunnelSessionStatus } from '../../lib/types';
 import { C, ACCENT, MONO, SANS, dot, badge, statusColor } from '../../lib/styles';
 import { api } from '../../lib/api';
 import { log } from '../../lib/logger';
@@ -28,6 +28,10 @@ const inputStyle: CSSProperties = {
   padding: '7px 10px',
   font: `400 12px ${MONO}`,
   outline: 'none',
+  // border-box + full width so inputs stay inside their grid columns.
+  boxSizing: 'border-box',
+  width: '100%',
+  minWidth: 0,
 };
 
 const selectStyle: CSSProperties = {
@@ -38,6 +42,9 @@ const selectStyle: CSSProperties = {
   padding: '7px 8px',
   font: `400 12px ${MONO}`,
   outline: 'none',
+  boxSizing: 'border-box',
+  width: '100%',
+  minWidth: 0,
 };
 
 export default function Endpoints(props: EndpointsProps): React.JSX.Element {
@@ -46,6 +53,12 @@ export default function Endpoints(props: EndpointsProps): React.JSX.Element {
   const [addOpen, setAddOpen] = useState(false);
   const [form, setForm] = useState({ name: '', type: 'llama.cpp', alias: '', url: '', key: '', tunnel: '' });
   const [tests, setTests] = useState<Record<string, TestEntry>>({});
+
+  // ~/.ssh/config hosts, so a shorthand tunnel command can be built from a real
+  // alias and we can show the actual IdentityFile ssh will use (not a guess).
+  const [sshHosts, setSshHosts] = useState<SshHostOut[]>([]);
+  const [tunnelHint, setTunnelHint] = useState<string | null>(null);
+  useEffect(() => { api.sshHosts().then(setSshHosts).catch(() => { /* no config */ }); }, []);
 
   // Editing an existing endpoint's name/type/alias/url/key inline.
   const [editId, setEditId] = useState<string | null>(null);
@@ -99,6 +112,22 @@ export default function Endpoints(props: EndpointsProps): React.JSX.Element {
       // api already logs errors
     }
   }, [form, refresh]);
+
+  // Build a shorthand `ssh -N -L ...` from a ~/.ssh/config alias, and surface
+  // the real IdentityFile ssh resolves for it (or warn if none is configured).
+  const pickTunnelHost = useCallback((alias: string) => {
+    const h = sshHosts.find(x => x.alias === alias);
+    if (!h) { setTunnelHint(null); return; }
+    let port = 8000;
+    try { const u = new URL(form.url); if (u.port) port = +u.port; } catch { /* ignore */ }
+    setForm(f => ({ ...f, tunnel: `ssh -N -L 127.0.0.1:${port}:localhost:${port} ${alias}` }));
+    const via = h.proxyjump ? ` · via ${h.proxyjump}` : '';
+    setTunnelHint(
+      h.identity_explicit && h.identity_file
+        ? `identity: ${h.identity_file} (from ~/.ssh/config)${via}`
+        : `no specific key configured — ssh will try your default keys${via}`,
+    );
+  }, [sshHosts, form.url]);
 
   const connectTunnel = useCallback(async (id: string) => {
     setConnecting(c => ({ ...c, [id]: true }));
@@ -335,9 +364,33 @@ export default function Endpoints(props: EndpointsProps): React.JSX.Element {
           <input
             placeholder='ssh tunnel command (optional) — e.g. ssh -N -L 127.0.0.1:9090:localhost:9090 skynet-alt'
             value={form.tunnel}
-            onChange={handleFormChange('tunnel')}
+            onChange={(e) => { handleFormChange('tunnel')(e); setTunnelHint(null); }}
             style={inputStyle}
           />
+          {sshHosts.length > 0 && (
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+              <span style={{ font: `400 10.5px ${SANS}`, color: C.textDim, whiteSpace: 'nowrap' }}>
+                or build from ~/.ssh/config:
+              </span>
+              <select
+                defaultValue=""
+                onChange={(e) => { if (e.target.value) pickTunnelHost(e.target.value); }}
+                style={{ ...selectStyle, width: 'auto', minWidth: 180, cursor: 'pointer' }}
+              >
+                <option value="">— pick a host —</option>
+                {sshHosts.map((h) => (
+                  <option key={h.alias} value={h.alias}>
+                    {h.alias}{h.hostname ? ` (${h.hostname})` : ''}{h.proxyjump ? ` ↝ ${h.proxyjump}` : ''}
+                  </option>
+                ))}
+              </select>
+              {tunnelHint && (
+                <span style={{ font: `400 10px ${MONO}`, color: C.textDim, wordBreak: 'break-all' }}>
+                  {tunnelHint}
+                </span>
+              )}
+            </div>
+          )}
           <span style={{ font: `400 10.5px ${SANS}`, color: C.textDim }}>
             alias = routing name: clients send it as the <span style={{ fontFamily: MONO }}>model</span> to reach this server directly
             (e.g. <span style={{ fontFamily: MONO }}>"model": "skynet"</span>); relay rewrites it to the server's real model.
