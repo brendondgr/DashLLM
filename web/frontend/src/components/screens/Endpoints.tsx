@@ -81,11 +81,8 @@ export default function Endpoints(props: EndpointsProps): React.JSX.Element {
   for (const s of sessionList ?? []) sessions[s.endpoint_id] = s;
 
   const [connecting, setConnecting] = useState<Record<string, boolean>>({});
-  const [reply, setReply] = useState('');
-
-  // The single endpoint whose ssh is currently waiting for input drives the modal.
-  const awaiting = (sessionList ?? []).find(s => s.status === 'awaiting_input') ?? null;
-  useEffect(() => { setReply(''); }, [awaiting?.endpoint_id, awaiting?.prompt]);
+  // Per-endpoint terminal input: typed lines / prompt answers sent to the PTY.
+  const [termInput, setTermInput] = useState<Record<string, string>>({});
 
   const toggleAdd = useCallback(() => setAddOpen(o => !o), []);
 
@@ -150,17 +147,18 @@ export default function Endpoints(props: EndpointsProps): React.JSX.Element {
     }
   }, []);
 
-  const submitReply = useCallback(async () => {
-    if (!awaiting) return;
-    const id = awaiting.endpoint_id;
-    log.info('endpoints.tunnel.respond', `${id} secret=${awaiting.prompt_secret}`);
+  // Send a line straight into the endpoint's ssh PTY (answers a prompt or just
+  // types into the terminal). Clears the per-endpoint input on success.
+  const sendToTunnel = useCallback(async (id: string, secret: boolean) => {
+    const text = termInput[id] ?? '';
+    log.info('endpoints.tunnel.respond', `${id} secret=${secret}`);
     try {
-      await api.respondEndpointTunnel(id, reply);
-      setReply('');
+      await api.respondEndpointTunnel(id, text);
+      setTermInput(m => ({ ...m, [id]: '' }));
     } catch {
       // api already logs errors
     }
-  }, [awaiting, reply]);
+  }, [termInput]);
 
   const testEndpoint = useCallback(async (id: string, baseUrl: string) => {
     setTests(t => ({ ...t, [id]: { state: 'testing', result: null } }));
@@ -648,18 +646,85 @@ export default function Endpoints(props: EndpointsProps): React.JSX.Element {
                 {testMsg}
               </div>
             )}
-            {tunnelMsg && (
-              <div style={{
-                font: `400 11px ${MONO}`,
-                color: tunnelColor,
-                background: C.bg,
-                border: `1px solid ${C.border}`,
-                borderRadius: 6,
-                padding: '8px 12px',
-              }}>
-                {tunnelMsg}
-              </div>
-            )}
+            {/* Interactive terminal: live ssh output for this endpoint's tunnel.
+                Appears once Connect starts a session; a password/passphrase or
+                host-key prompt is answered right here in the input line. */}
+            {sess && (sStatus === 'connecting' || sStatus === 'awaiting_input'
+                || sStatus === 'up' || sStatus === 'error'
+                || (sess.output?.length ?? 0) > 0) && (() => {
+              const live = sStatus === 'connecting' || sStatus === 'awaiting_input' || sStatus === 'up';
+              const secret = !!sess.prompt_secret;
+              return (
+                <div style={{
+                  display: 'flex', flexDirection: 'column', gap: 8,
+                  background: C.bg, border: `1px solid ${C.border}`, borderRadius: 6, padding: 12,
+                }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <div style={{
+                      width: 7, height: 7, borderRadius: '50%', background: tunnelColor,
+                      animation: live ? 'livepulse 2s infinite' : 'none',
+                    }} />
+                    <span style={{ font: `600 10px ${SANS}`, letterSpacing: '.06em', textTransform: 'uppercase', color: C.textMut }}>
+                      Terminal
+                    </span>
+                    {tunnelMsg && (
+                      <span style={{ font: `400 10.5px ${MONO}`, color: tunnelColor, marginLeft: 'auto' }}>
+                        {tunnelMsg}
+                      </span>
+                    )}
+                  </div>
+                  <div
+                    ref={(el) => { if (el) el.scrollTop = el.scrollHeight; }}
+                    style={{
+                      background: '#05070B', border: `1px solid ${C.border}`, borderRadius: 6,
+                      padding: '10px 12px', maxHeight: 220, overflowY: 'auto',
+                      font: `400 11.5px/1.55 ${MONO}`, color: C.text,
+                      whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+                    }}
+                  >
+                    {(sess.output ?? []).length === 0
+                      ? <span style={{ color: C.textDim }}>ssh starting…</span>
+                      : (sess.output ?? []).map((ln, i) => <div key={i}>{ln}</div>)}
+                  </div>
+                  <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                    <span style={{ font: `600 13px ${MONO}`, color: sStatus === 'awaiting_input' ? ACCENT : C.textDim }}>
+                      {sStatus === 'awaiting_input' ? '?' : '›'}
+                    </span>
+                    <input
+                      type={secret ? 'password' : 'text'}
+                      value={termInput[e.id] ?? ''}
+                      disabled={!live}
+                      placeholder={
+                        !live ? 'session not connected'
+                        : sStatus === 'awaiting_input' ? (sess.prompt ?? 'ssh is asking for input')
+                        : 'send a line to the terminal (e.g. yes)'
+                      }
+                      onChange={(ev) => { const v = ev.target.value; setTermInput(m => ({ ...m, [e.id]: v })); }}
+                      onKeyDown={(ev) => { if (ev.key === 'Enter') void sendToTunnel(e.id, secret); }}
+                      style={{ ...inputStyle, flex: 1, opacity: live ? 1 : 0.6 }}
+                    />
+                    <div
+                      onClick={() => { if (live) void sendToTunnel(e.id, secret); }}
+                      style={{
+                        padding: '7px 14px', borderRadius: 6,
+                        background: live ? ACCENT : C.bgInset,
+                        border: live ? 'none' : `1px solid ${C.borderStrong}`,
+                        color: live ? '#0B0E14' : C.textDim,
+                        font: `600 11px ${SANS}`, cursor: live ? 'pointer' : 'default',
+                        userSelect: 'none', whiteSpace: 'nowrap',
+                      }}
+                    >
+                      Send
+                    </div>
+                  </div>
+                  {secret && sStatus === 'awaiting_input' && (
+                    <span style={{ font: `400 10px ${SANS}`, color: C.textDim }}>
+                      Sent straight to ssh over the local PTY; never stored or logged.
+                    </span>
+                  )}
+                </div>
+              );
+            })()}
 
             {/* Edit endpoint */}
             {editId === e.id && (
@@ -784,82 +849,6 @@ export default function Endpoints(props: EndpointsProps): React.JSX.Element {
           </div>
         );
       })}
-
-      {/* Interactive prompt modal — appears when ssh is waiting for input. */}
-      {awaiting && (
-        <div
-          onClick={() => { /* backdrop click is a no-op; use buttons */ }}
-          style={{
-            position: 'fixed', inset: 0, zIndex: 50,
-            background: 'rgba(4,6,10,.62)',
-            display: 'flex', alignItems: 'center', justifyContent: 'center',
-          }}
-        >
-          <div style={{
-            width: 460, maxWidth: '92vw',
-            background: C.bgCard,
-            border: `1px solid ${C.borderStrong}`,
-            borderRadius: 10,
-            padding: 20,
-            display: 'flex', flexDirection: 'column', gap: 12,
-            boxShadow: '0 18px 50px rgba(0,0,0,.5)',
-          }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-              <div style={{ width: 8, height: 8, borderRadius: '50%', background: ACCENT, animation: 'livepulse 2s infinite' }} />
-              <span style={{ font: `600 12px ${SANS}`, letterSpacing: '.04em', color: C.text }}>
-                SSH is asking for input
-              </span>
-            </div>
-            <div style={{
-              font: `400 12px ${MONO}`,
-              color: C.cyan,
-              background: C.bg,
-              border: `1px solid ${C.border}`,
-              borderRadius: 6,
-              padding: '10px 12px',
-              wordBreak: 'break-word',
-            }}>
-              {awaiting.prompt ?? 'input required'}
-            </div>
-            <input
-              autoFocus
-              type={awaiting.prompt_secret ? 'password' : 'text'}
-              value={reply}
-              onChange={(ev) => setReply(ev.target.value)}
-              onKeyDown={(ev) => { if (ev.key === 'Enter') submitReply(); }}
-              placeholder={awaiting.prompt_secret ? 'password / passphrase' : 'type your answer (e.g. yes)'}
-              style={{ ...inputStyle, padding: '9px 12px' }}
-            />
-            <span style={{ font: `400 10.5px ${SANS}`, color: C.textDim }}>
-              {awaiting.prompt_secret
-                ? 'Sent straight to ssh over the local PTY; never stored or logged.'
-                : 'Sent to the ssh process. For a host-key prompt, answer yes.'}
-            </span>
-            <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
-              <div
-                onClick={() => disconnectTunnel(awaiting.endpoint_id)}
-                style={{
-                  padding: '7px 14px', borderRadius: 6,
-                  border: `1px solid ${C.borderStrong}`,
-                  color: C.textMut, font: `500 12px ${SANS}`, cursor: 'pointer', userSelect: 'none',
-                }}
-              >
-                Cancel
-              </div>
-              <div
-                onClick={submitReply}
-                style={{
-                  padding: '7px 16px', borderRadius: 6,
-                  background: ACCENT, color: '#0B0E14',
-                  font: `600 12px ${SANS}`, cursor: 'pointer', userSelect: 'none',
-                }}
-              >
-                Submit
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   );
 }
