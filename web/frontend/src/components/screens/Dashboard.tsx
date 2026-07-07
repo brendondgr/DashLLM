@@ -9,13 +9,13 @@ import {
   concurrencyOption,
   dailyOption,
   hourOfDayOption,
-  tokensOption,
-  volumeOption,
+  volumeTokensOption,
 } from '../../lib/chartOptions';
 import { fmt } from '../../lib/format';
 import { log } from '../../lib/logger';
 import { ACCENT, C, MONO, SANS, segStyle } from '../../lib/styles';
 import type {
+  DetailLevel,
   EndpointOut,
   LiveSnapshot,
   RangeId,
@@ -32,25 +32,34 @@ interface Props {
 
 const RANGES: [RangeId, string][] = [
   ['1h', '1H live'], ['24h', '24H'], ['7d', '7D'], ['30d', '30D'],
-  ['custom', 'Custom'],
+  ['1y', '1Y'], ['custom', 'Custom'],
+];
+const DETAILS: [DetailLevel, string][] = [
+  ['summary', 'Summary'], ['detailed', 'Detailed'],
 ];
 const LAYOUTS: [LayoutId, string][] = [
   ['A', 'Overview'], ['B', 'Timeline'], ['C', 'Dense'],
 ];
 
-/** Panel grids per layout: [span, height, order?] — verbatim from prototype. */
+/** Panel grids per layout: [span, height, order?]. The combined volume+tokens
+ * chart (`combo`) shares the top row with live concurrency at 2/3 : 1/3. */
 const PANELS: Record<LayoutId, Record<string, number[]>> = {
-  A: { vol: [12, 250], tok: [8, 300], conc: [4, 300], hod: [4, 250],
+  A: { combo: [8, 300], conc: [4, 300], hod: [4, 250],
        daily: [4, 250], break: [4, 250] },
-  B: { tok: [9, 360, 1], conc: [3, 360, 2], vol: [6, 230, 3],
-       hod: [6, 230, 4], daily: [8, 220, 5], break: [4, 220, 6] },
-  C: { vol: [4, 230, 1], tok: [4, 230, 2], conc: [4, 230, 3],
-       hod: [4, 230, 4], daily: [4, 230, 5], break: [4, 230, 6] },
+  B: { combo: [8, 340, 1], conc: [4, 340, 2], daily: [8, 240, 3],
+       hod: [4, 240, 4], break: [12, 220, 5] },
+  C: { combo: [6, 240, 1], conc: [6, 240, 2], hod: [4, 220, 3],
+       daily: [4, 220, 4], break: [4, 220, 5] },
 };
 
-const RANGE_CAPTIONS: Record<RangeId, string> = {
-  '1h': 'per minute · live', '24h': 'per hour', '7d': 'per hour',
-  '30d': 'per hour', custom: 'per hour · custom range',
+/** Bucket granularity caption per (range, detail) — mirrors the backend. */
+const GRAN: Record<RangeId, Record<DetailLevel, string>> = {
+  '1h': { summary: 'per minute · live', detailed: 'per minute · live' },
+  '24h': { summary: 'per hour', detailed: 'per 15 min' },
+  '7d': { summary: 'per day', detailed: 'per hour' },
+  '30d': { summary: 'per day', detailed: 'per 3 hours' },
+  '1y': { summary: 'per month', detailed: 'per day' },
+  custom: { summary: 'per hour · custom', detailed: 'per hour · custom' },
 };
 
 const isoDay = (offsetDays: number): string =>
@@ -58,6 +67,7 @@ const isoDay = (offsetDays: number): string =>
 
 export default function Dashboard({ live, endpoints }: Props) {
   const [rangeId, setRangeId] = useState<RangeId>('24h');
+  const [detail, setDetailState] = useState<DetailLevel>('summary');
   const [layout, setLayout] = useState<LayoutId>('A');
   const [customFrom, setCustomFrom] = useState(isoDay(7));
   const [customTo, setCustomTo] = useState(isoDay(0));
@@ -76,22 +86,24 @@ export default function Dashboard({ live, endpoints }: Props) {
   const { data: summary } = usePoll(
     () => api.summary(range), statsInterval, [rangeKey]);
   const { data: volume } = usePoll(
-    () => api.volume(range), statsInterval, [rangeKey]);
+    () => api.volume(range, detail), statsInterval, [rangeKey, detail]);
   const { data: tokens } = usePoll(
-    () => api.tokensTimeseries(range), statsInterval, [rangeKey]);
+    () => api.tokensTimeseries(range, detail), statsInterval,
+    [rangeKey, detail]);
   const { data: byHour } = usePoll(
     () => api.tokensByHour({ id: '30d' }), 15000);
-  const dailyRange: RangeSel = rangeId === '30d' || rangeId === 'custom'
-    ? range : { id: '7d' };
+  const dailyRange: RangeSel =
+    rangeId === '30d' || rangeId === '1y' || rangeId === 'custom'
+      ? range : { id: '7d' };
   const { data: byDay } = usePoll(
     () => api.tokensByDay(dailyRange), statsInterval, [rangeKey]);
   const { data: byEndpoint } = usePoll(
     () => api.byEndpoint(range), 10000, [rangeKey]);
 
-  const volOpt = useMemo(
-    () => (volume ? volumeOption(volume, rangeId) : null), [volume, rangeId]);
-  const tokOpt = useMemo(
-    () => (tokens ? tokensOption(tokens, rangeId) : null), [tokens, rangeId]);
+  const comboOpt = useMemo(
+    () => (volume && tokens
+      ? volumeTokensOption(volume, tokens, rangeId) : null),
+    [volume, tokens, rangeId]);
   const concOpt = useMemo(
     () => (live ? concurrencyOption(live.series, live.max_concurrency) : null),
     [live]);
@@ -110,6 +122,10 @@ export default function Dashboard({ live, endpoints }: Props) {
   const setRange = (id: RangeId) => {
     log.info('dash.range', id);
     setRangeId(id);
+  };
+  const setDetail = (id: DetailLevel) => {
+    log.info('dash.detail', id);
+    setDetailState(id);
   };
   const pickLayout = (id: LayoutId) => {
     log.info('dash.layout', id);
@@ -144,6 +160,7 @@ export default function Dashboard({ live, endpoints }: Props) {
   }));
 
   const dailyTitle = rangeId === '30d' ? 'Tokens per day · 30d'
+    : rangeId === '1y' ? 'Tokens per day · 1y'
     : rangeId === 'custom' ? 'Tokens per day · range' : 'Tokens per day · 7d';
 
   const panelCard: CSSProperties = {
@@ -169,6 +186,17 @@ export default function Dashboard({ live, endpoints }: Props) {
         }}>
           {RANGES.map(([id, label]) => (
             <div key={id} onClick={() => setRange(id)} style={segStyle(rangeId === id)}>
+              {label}
+            </div>
+          ))}
+        </div>
+        <div style={{
+          display: 'flex', background: C.bgInset,
+          border: `1px solid ${C.border}`, borderRadius: 7, padding: 2, gap: 2,
+        }}>
+          {DETAILS.map(([id, label]) => (
+            <div key={id} onClick={() => setDetail(id)}
+              style={segStyle(detail === id)}>
               {label}
             </div>
           ))}
@@ -235,33 +263,18 @@ export default function Dashboard({ live, endpoints }: Props) {
       <div style={{
         display: 'grid', gridTemplateColumns: 'repeat(12,1fr)', gap: 12,
       }}>
-        <div style={pstyle('vol')}>
+        <div style={pstyle('combo')}>
           <div style={panelCard}>
             <div style={{
               display: 'flex', alignItems: 'baseline',
               justifyContent: 'space-between', marginBottom: 4,
             }}>
-              <span style={panelTitle}>Request volume</span>
+              <span style={panelTitle}>Request volume &amp; tokens</span>
               <span style={{ font: `400 10px ${MONO}`, color: C.textDim }}>
-                {RANGE_CAPTIONS[rangeId]}
+                {GRAN[rangeId][detail]} · drag to zoom
               </span>
             </div>
-            <EChart option={volOpt} />
-          </div>
-        </div>
-
-        <div style={pstyle('tok')}>
-          <div style={panelCard}>
-            <div style={{
-              display: 'flex', alignItems: 'baseline',
-              justifyContent: 'space-between', marginBottom: 4,
-            }}>
-              <span style={panelTitle}>Tokens in / out</span>
-              <span style={{ font: `400 10px ${MONO}`, color: C.textDim }}>
-                drag to zoom · brush below
-              </span>
-            </div>
-            <EChart option={tokOpt} />
+            <EChart option={comboOpt} />
           </div>
         </div>
 

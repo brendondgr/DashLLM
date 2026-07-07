@@ -70,6 +70,20 @@ export interface TunnelSessionStatus {
   uptime_s: number;
 }
 
+/** A `~/.ssh/config` host alias resolved via `ssh -G` to its real settings —
+ * so shorthand tunnel commands use the actual IdentityFile, not a guess. */
+export interface SshHostOut {
+  alias: string;
+  hostname: string | null;
+  user: string | null;
+  port: number;
+  identity_files: string[];
+  identity_file: string | null;
+  /** true when a specific key is configured (vs. the default key fan-out). */
+  identity_explicit: boolean;
+  proxyjump: string | null;
+}
+
 /** A saved ssh command candidate for an endpoint's tunnel — lets a flaky
  * route (e.g. "skynet-alt") be swapped for a working one without touching
  * the endpoint's alias or base_url. */
@@ -182,7 +196,9 @@ export interface RouterState {
 }
 
 /** Dashboard time range selection. */
-export type RangeId = '1h' | '24h' | '7d' | '30d' | 'custom';
+export type RangeId = '1h' | '24h' | '7d' | '30d' | '1y' | 'custom';
+/** Tick granularity for the combined volume/tokens chart. */
+export type DetailLevel = 'summary' | 'detailed';
 export interface RangeSel {
   id: RangeId;
   /** unix seconds, only for custom */

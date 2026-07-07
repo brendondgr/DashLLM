@@ -21,6 +21,9 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "web" / "backend"))
 
 from app.db import Database  # noqa: E402
+from app.services.rollup import (  # noqa: E402
+    HIST_UPSERT, SUM_UPSERT, build_rollup_rows,
+)
 
 MODELS = ["gemma-4-26B-it", "default-model"]
 
@@ -80,6 +83,27 @@ def seed(db: Database, days: int) -> int:
     return len(rows)
 
 
+def rebuild_rollups(db: Database) -> None:
+    """Rebuild the hourly rollups from raw rows so the dashboard's rollup-backed
+    windows (24h/7d/30d/1y) reflect seeded data. Seeding bypasses the live
+    telemetry writer that normally maintains rollups incrementally, so a full
+    rebuild keeps the two in sync (also correct after ``--wipe``)."""
+    db.execute("DELETE FROM request_rollup_hourly")
+    db.execute("DELETE FROM request_rollup_hist")
+    raw = db.query(
+        "SELECT ts, endpoint_id, endpoint_name, model, ok, prompt_tokens,"
+        " completion_tokens, total_tokens, cost_usd, ttft_ms, latency_ms,"
+        " tokens_per_sec FROM requests")
+    sum_rows, hist_rows = build_rollup_rows(raw)
+    if sum_rows:
+        db.executemany(SUM_UPSERT, sum_rows)
+    if hist_rows:
+        db.executemany(HIST_UPSERT, hist_rows)
+    db.execute(
+        "INSERT OR REPLACE INTO settings (key, value) VALUES"
+        " ('rollup_built', '1')")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--days", type=int, default=30)
@@ -95,9 +119,10 @@ def main() -> None:
             "DELETE FROM requests WHERE client_key = '…seed'")
         print(f"removed {removed} previously seeded rows")
     n = seed(db, args.days)
+    rebuild_rollups(db)
     total = db.query_one("SELECT COUNT(*) AS n FROM requests")["n"]
     print(f"seeded {n} rows over {args.days} days into {args.db}"
-          f" (table now has {total})")
+          f" (table now has {total}); rollups rebuilt")
     db.close()
 
 

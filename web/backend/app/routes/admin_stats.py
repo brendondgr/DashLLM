@@ -26,13 +26,15 @@ async def summary(request: Request, p: dict = Depends(_params)):
 
 
 @router.get("/volume")
-async def volume(request: Request, p: dict = Depends(_params)):
-    return await request.app.state.stats.volume(**p)
+async def volume(request: Request, p: dict = Depends(_params),
+                 detail: str = Query(default="summary")):
+    return await request.app.state.stats.volume(**p, detail=detail)
 
 
 @router.get("/tokens/timeseries")
-async def tokens_timeseries(request: Request, p: dict = Depends(_params)):
-    return await request.app.state.stats.tokens_timeseries(**p)
+async def tokens_timeseries(request: Request, p: dict = Depends(_params),
+                            detail: str = Query(default="summary")):
+    return await request.app.state.stats.tokens_timeseries(**p, detail=detail)
 
 
 @router.get("/tokens/by-hour")
