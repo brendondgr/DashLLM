@@ -129,6 +129,25 @@ class Router:
         st = self.state.get(eid)
         return st.model if st else None
 
+    def clear_model_override(self, eid: str) -> str | None:
+        """Drop a stale model_override (memory + DB). Returns the removed
+        value, or None if there was nothing to clear. Used to self-heal when
+        the upstream rejects the pinned model because it was swapped out."""
+        row = self.endpoints.get(eid)
+        if row is None:
+            return None
+        prev = row.get("model_override")
+        if not prev:
+            return None
+        row["model_override"] = None
+        self.db.execute(
+            "UPDATE endpoints SET model_override = NULL WHERE id = ?", (eid,))
+        log.warning("cleared stale model_override", extra={"data": {
+            "endpoint": row["name"], "was": prev,
+            "now_serving": self.state.get(eid).models if self.state.get(eid)
+            else []}})
+        return prev
+
     # ---- CRUD --------------------------------------------------------------
     def create(self, spec: EndpointCreate) -> dict:
         eid = str(uuid.uuid4())

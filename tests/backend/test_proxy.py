@@ -122,6 +122,43 @@ def test_alias_routing_respects_model_override(proxy_env):
     assert calls["last_model"] == "my-exact-model"
 
 
+def test_stale_model_override_self_heals(proxy_env):
+    client, app, calls = proxy_env
+    # Port pins a model that it no longer serves (the model was swapped out).
+    _register(client, "swapped", "http://strict/v1", alias="local",
+              model_override="gemma-4-26B-it")
+    router = app.state.router
+    eid = router.resolve_alias("local")["id"]
+    # Registration probed /models and discovered the live model.
+    assert router.state[eid].model == "fake-model-7b"
+
+    r = client.post("/v1/chat/completions", json={
+        "model": "local", "messages": [{"role": "user", "content": "hi"}]})
+    # First send used the stale override -> upstream 404; the proxy cleared the
+    # override and retried the SAME port with the discovered model -> success.
+    assert r.status_code == 200, r.text
+    row = _wait_rows(app, 1)[-1]
+    assert row["model"] == "fake-model-7b" and row["ok"] == 1
+    # The stale override is gone for good (persisted), so it self-healed.
+    assert router.endpoints[eid]["model_override"] is None
+    assert app.state.db.query_one(
+        "SELECT model_override FROM endpoints WHERE id = ?",
+        (eid,))["model_override"] is None
+
+
+def test_valid_override_is_not_disturbed(proxy_env):
+    # An override the upstream accepts (even if not in /v1/models) must stay.
+    client, app, calls = proxy_env
+    _register(client, "ov", "http://good/v1", alias="local",
+              model_override="my-exact-model")
+    r = client.post("/v1/chat/completions", json={
+        "model": "local", "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 200
+    assert calls["last_model"] == "my-exact-model"
+    eid = app.state.router.resolve_alias("local")["id"]
+    assert app.state.router.endpoints[eid]["model_override"] == "my-exact-model"
+
+
 def test_alias_routing_does_not_fail_over(proxy_env):
     client, app, calls = proxy_env
     _register(client, "good", "http://good/v1", priority=500)

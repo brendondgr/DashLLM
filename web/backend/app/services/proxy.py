@@ -36,6 +36,19 @@ _HOP_BY_HOP = {
 _BODY_LIMIT = 100_000  # chars kept per body when log_bodies is on
 _TAIL_LIMIT = 65_536  # bytes of SSE tail kept for usage parsing
 
+# Substrings upstreams use when the requested model id isn't served. Used to
+# self-heal a stale model_override after the model on a port is swapped out.
+_UNKNOWN_MODEL_MARKERS = (
+    "does not exist", "not found", "no such model", "unknown model",
+    "invalid model", "model_not_found", "unknown_model", "not available",
+    "no models loaded",
+)
+
+
+def _has_unknown_model_marker(content: bytes) -> bool:
+    text = content[:1000].decode(errors="replace").lower()
+    return "model" in text and any(m in text for m in _UNKNOWN_MODEL_MARKERS)
+
 
 def _route_name(path: str) -> str:
     p = path.strip("/")
@@ -167,6 +180,11 @@ class ProxyService:
         # "auto" (the advertised default) is rewritten per resolved endpoint
         # at forward time — upstreams don't know a model called "auto".
         rewrite_auto = requested_model == "auto" and body_json is not None
+        # Alias routes also keep the parsed body around so the model can be
+        # re-resolved per attempt — needed to retry with the discovered model
+        # if a stale model_override is rejected upstream.
+        dispatch_body_json = (
+            body_json if (rewrite_auto or alias_endpoint is not None) else None)
 
         # Count the request as in-flight the moment it is accepted — before it
         # waits on a concurrency slot or on the upstream to start answering — so
@@ -188,7 +206,7 @@ class ProxyService:
                 response = await self._dispatch(
                     request, path, record, body_bytes, t0,
                     force_endpoint=alias_endpoint,
-                    body_json=body_json if rewrite_auto else None)
+                    body_json=dispatch_body_json)
             # A streaming response stays in-flight until its stream ends; the
             # tee generator calls live.finish() itself. Everything else (a
             # buffered body or an error response) is done now.
@@ -261,9 +279,9 @@ class ProxyService:
                     503, f"endpoint for model {force_endpoint['alias']!r}"
                     " is disabled")
             try:
-                return await self._forward(
+                return await self._forward_healing(
                     request, force_endpoint, path, record,
-                    body_for(force_endpoint), t0)
+                    lambda: body_for(force_endpoint), t0)
             except _RetryableUpstreamError as e:
                 self.router.report_failure(force_endpoint["id"], str(e))
                 record.error = str(e)[:500]
@@ -294,8 +312,9 @@ class ProxyService:
             record.endpoint_id = endpoint["id"]
             record.endpoint_name = endpoint["name"]
             try:
-                return await self._forward(
-                    request, endpoint, path, record, body_for(endpoint), t0)
+                return await self._forward_healing(
+                    request, endpoint, path, record,
+                    lambda: body_for(endpoint), t0)
             except _RetryableUpstreamError as e:
                 self.router.report_failure(endpoint["id"], str(e))
                 log.warning("upstream failed pre-first-byte", extra={"data": {
@@ -309,6 +328,48 @@ class ProxyService:
                     self.telemetry.submit(record)
                     return _upstream_error(
                         record.status, f"upstream error: {e}")
+
+    @staticmethod
+    def _is_stale_override(endpoint: dict, record: RequestRecord,
+                           content: bytes) -> bool:
+        """True when the upstream rejected THIS endpoint's model_override as an
+        unknown model — i.e. the model we just sent was the pinned override and
+        the server says it doesn't have it."""
+        override = endpoint.get("model_override")
+        return bool(
+            override and record.model == override
+            and _has_unknown_model_marker(content))
+
+    async def _forward_healing(self, request: Request, endpoint: dict,
+                               path: str, record: RequestRecord,
+                               make_body, t0: float) -> Response:
+        """Forward once; if the upstream rejects a stale model_override as an
+        unknown model, clear the override and retry the SAME endpoint with the
+        re-resolved (discovered) model. Never switches endpoints, so alias
+        pinning still holds. Self-heals a model that was swapped out on a port
+        without any manual reconfiguration."""
+        try:
+            return await self._forward(
+                request, endpoint, path, record, make_body(), t0)
+        except _StaleModelOverride as stale:
+            removed = self.router.clear_model_override(endpoint["id"])
+            new_model = self.router.upstream_model(endpoint["id"])
+            log.warning("healing stale model_override; retrying", extra={
+                "data": {"id": record.id, "endpoint": endpoint["name"],
+                         "removed": removed or stale.model,
+                         "retry_model": new_model}})
+            # Override is gone now, so make_body() resolves the discovered
+            # model. Guard: if nothing usable was discovered, surface the
+            # rejection through the normal failure path (records telemetry;
+            # the auto path may then try another endpoint) rather than
+            # resending the dead model.
+            if not new_model or new_model == stale.model:
+                raise _RetryableUpstreamError(
+                    f"model {stale.model!r} no longer served by "
+                    f"{endpoint['name']!r}; no replacement discovered",
+                    status=502)
+            return await self._forward(
+                request, endpoint, path, record, make_body(), t0)
 
     async def _forward(self, request: Request, endpoint: dict, path: str,
                        record: RequestRecord, body: bytes,
@@ -340,10 +401,12 @@ class ProxyService:
             raise _RetryableUpstreamError(f"{type(e).__name__}: {e}") from e
 
         if resp.status_code >= 500:
-            text = (await resp.aread())[:300]
+            text = (await resp.aread())[:1000]
             await resp.aclose()
+            if self._is_stale_override(endpoint, record, text):
+                raise _StaleModelOverride(endpoint["model_override"])
             raise _RetryableUpstreamError(
-                f"HTTP {resp.status_code}: {text.decode(errors='replace')}",
+                f"HTTP {resp.status_code}: {text[:300].decode(errors='replace')}",
                 status=resp.status_code)
 
         if record.stream and resp.headers.get(
@@ -359,6 +422,14 @@ class ProxyService:
             content = await resp.aread()
         finally:
             await resp.aclose()
+
+        # A 4xx that names an unknown model + a pinned override = the model was
+        # swapped out on this port. Signal the dispatch layer to self-heal
+        # (clear the override, retry with the discovered model) before this
+        # attempt is recorded as a failure.
+        if (400 <= resp.status_code < 500
+                and self._is_stale_override(endpoint, record, content)):
+            raise _StaleModelOverride(endpoint["model_override"])
 
         record.status = resp.status_code
         record.ok = resp.status_code < 400
@@ -489,3 +560,13 @@ class _RetryableUpstreamError(Exception):
     def __init__(self, message: str, status: int | None = None):
         super().__init__(message)
         self.status = status
+
+
+class _StaleModelOverride(Exception):
+    """Upstream rejected the endpoint's pinned model_override as unknown — the
+    model on that port was swapped out. Signals the dispatch layer to clear
+    the override and retry the same endpoint with the discovered model."""
+
+    def __init__(self, model: str):
+        super().__init__(model)
+        self.model = model

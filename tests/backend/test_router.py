@@ -91,6 +91,38 @@ def test_delete_moves_pin(router):
     assert router.pinned_id == b["id"]
 
 
+def _ep_model(name: str, override: str | None) -> EndpointCreate:
+    return EndpointCreate(
+        name=name, base_url="http://127.0.0.1:7070/v1", alias="local",
+        model_override=override)
+
+
+def test_override_is_the_upstream_model(router):
+    a = router.create(_ep_model("a", "gemma-4-26B-it"))
+    # Explicit override wins over any discovered model, and is honored even
+    # before/without discovery (an exact pin the /models list may not list).
+    assert router.upstream_model(a["id"]) == "gemma-4-26B-it"
+    router.set_models(a["id"], ["default"])
+    assert router.upstream_model(a["id"]) == "gemma-4-26B-it"
+
+
+def test_clear_model_override_self_heals(router, db):
+    a = router.create(_ep_model("a", "gemma-4-26B-it"))
+    router.set_models(a["id"], ["qwen-3.6-27B-it", "default"])
+    # Simulate the proxy healing a swap: drop the stale override.
+    removed = router.clear_model_override(a["id"])
+    assert removed == "gemma-4-26B-it"
+    # Alias now tracks the discovered model, and it's persisted.
+    assert router.endpoints[a["id"]]["model_override"] is None
+    assert router.upstream_model(a["id"]) == "qwen-3.6-27B-it"
+    assert Router(db).endpoints[a["id"]]["model_override"] is None
+
+
+def test_clear_model_override_noop_without_override(router):
+    a = router.create(_ep_model("a", None))
+    assert router.clear_model_override(a["id"]) is None
+
+
 def test_state_survives_reload(router, db):
     a = router.create(_ep("a"))
     b = router.create(_ep("b"))

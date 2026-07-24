@@ -11,7 +11,7 @@ import json
 
 import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 
 def make_upstream() -> tuple[FastAPI, dict]:
@@ -65,6 +65,35 @@ def make_upstream() -> tuple[FastAPI, dict]:
     return up, calls
 
 
+def make_strict_upstream() -> FastAPI:
+    """Serves exactly one model and rejects any other id with an OpenAI-style
+    ``model does not exist`` 404 — exercises the proxy's stale-override heal
+    (a port whose model was swapped out under a pinned ``model_override``)."""
+    up = FastAPI()
+    served = "fake-model-7b"
+
+    @up.get("/v1/models")
+    async def models():
+        return {"data": [{"id": served}]}
+
+    @up.post("/v1/chat/completions")
+    async def chat(request: Request):
+        body = await request.json()
+        if body.get("model") != served:
+            return JSONResponse(status_code=404, content={"error": {
+                "message": f"The model `{body.get('model')}` does not exist.",
+                "type": "invalid_request_error", "code": "model_not_found"}})
+        return {
+            "id": "cmpl-strict", "object": "chat.completion", "model": served,
+            "choices": [{"index": 0, "finish_reason": "stop",
+                         "message": {"role": "assistant", "content": "ok"}}],
+            "usage": {"prompt_tokens": 4, "completion_tokens": 2,
+                      "total_tokens": 6},
+        }
+
+    return up
+
+
 class _AlwaysFailTransport(httpx.AsyncBaseTransport):
     async def handle_async_request(self, request):
         return httpx.Response(500, content=b"upstream exploded",
@@ -76,6 +105,7 @@ class RoutingTransport(httpx.AsyncBaseTransport):
         self._routes: dict[str, httpx.AsyncBaseTransport] = {
             "good": httpx.ASGITransport(app=upstream_app),
             "flaky": _AlwaysFailTransport(),
+            "strict": httpx.ASGITransport(app=make_strict_upstream()),
         }
 
     async def handle_async_request(self, request):
