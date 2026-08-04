@@ -3,6 +3,8 @@ capture, TTFT, stream_options injection, and pre-first-byte failover."""
 
 import time
 
+from app.services.telemetry import body_unpack
+
 
 def _register(client, name, url, priority=100, **extra):
     r = client.post("/admin/endpoints", json={
@@ -260,4 +262,6 @@ def test_bodies_captured_only_when_enabled(proxy_env):
     _wait_rows(app, 2)
     bodies = app.state.db.query("SELECT * FROM request_bodies")
     assert len(bodies) == 1
-    assert "logged prompt" in bodies[0]["prompt"]
+    # Bodies are stored zlib-compressed (telemetry.body_pack), so read them
+    # back through the inverse rather than asserting on the raw BLOB.
+    assert "logged prompt" in body_unpack(bodies[0]["prompt"])
