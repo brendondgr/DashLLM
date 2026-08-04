@@ -1,20 +1,42 @@
 # API Contract
 
-Shared contract between `web/backend` and `web/frontend`. The frontend's
-typed client (`web/frontend/src/lib/api.ts`) mirrors these shapes.
+Shared contract between `web/backend` and `web/frontend`. The authoritative
+source is `web/backend/app/schemas/__init__.py`; the frontend's typed client
+(`web/frontend/src/lib/types.ts`) mirrors it.
 
 ## Conventions
 
 - All admin responses are JSON. Errors: `{"detail": "..."}` with proper HTTP
-  status codes.
+  status codes. `/v1` proxy errors instead use the OpenAI error envelope:
+  `{"error": {"message", "type": "relay_proxy_error", "code"}}`.
 - Stats endpoints return the ECharts `dataset` contract:
-  `{ "dimensions": [...], "source": [[...], ...] }` — the frontend binds
-  series to dimensions with zero reshaping.
-- Secrets never round-trip: upstream keys and client keys are returned
-  masked (`…last4`); SSH key *paths* only, never key material.
-- Window params: `window` ∈ `1h|24h|7d|30d|all` **or** `from`+`to`
-  (unix seconds). `1h` buckets per minute; `24h`/`7d` per hour; `30d`/custom
-  per hour (per day for by-day).
+  `{"dimensions": [...], "source": [[...], ...]}` — the frontend binds series
+  to dimensions with zero reshaping.
+- Secrets never round-trip: upstream keys are exposed only as `has_key`; SSH
+  key *paths* only, never key material; PTY output is redacted before it is
+  surfaced.
+- Time buckets are **local time**, and zero-filled across the window so
+  category axes stay dense.
+
+### Window and detail params
+
+`window` ∈ `1h | 24h | 7d | 30d | 1y | all`, **or** `from`+`to` (unix
+seconds). `all` spans from the earliest recorded request. Unknown values fall
+back to `24h`.
+
+`/admin/stats/volume` and `/admin/stats/tokens/timeseries` also take
+`detail` ∈ `summary | detailed`, which selects the tick granularity:
+
+| window | `summary` | `detailed` |
+| --- | --- | --- |
+| `1h` | per minute | per minute |
+| `24h` | per hour | per 15 min |
+| `7d` | per day | per hour |
+| `30d` | per day | per 3 hours |
+| `1y` | per month | per day |
+| `all` / custom | per day / per hour | same |
+
+All stats endpoints also accept optional `endpoint_id` and `model` filters.
 
 ## Objects
 
@@ -25,56 +47,99 @@ typed client (`web/frontend/src/lib/api.ts`) mirrors these shapes.
   "kind": "local|remote_direct|remote_tunnel",
   "server_type": "llama.cpp|vLLM|ollama|openai",
   "base_url": "http://127.0.0.1:7070/v1",
-  "has_key": false, "tunnel_id": null,
-  "priority": 100, "enabled": true, "model": "gemma-4-26B-it",
-  "model_override": null,
+  "has_key": false,
+  "tunnel_id": null,
+  "tunnel_command": "ssh -N -L 9090:localhost:9090 skynet",
+  "tunnel_local_port": 9090,
+  "priority": 100, "weight": 1, "enabled": true,
+  "model": "gemma-4-26B-it", "model_override": null,
   "health": "healthy|degraded|failed|unknown",
   "ewma_latency_ms": 42.1, "last_ok_ts": 1780000000.0,
   "consecutive_fails": 0, "active": true, "share": 0.46
 }
 ```
-`model` is discovered from the endpoint's `/v1/models`. `share` is that
-endpoint's fraction of requests in the last 24h. `active` marks the router's
-current resolved target.
+
+`model` is discovered from the endpoint's `/v1/models` by the health prober.
+`share` is that endpoint's fraction of requests in the window. `active` marks
+the router's manual pin. `kind` is inferred from the URL and tunnel fields
+when not supplied. Writes accept `upstream_key` (never returned).
 
 ### Model-alias routing
 
-`alias` is a unique routing name (`[A-Za-z0-9._-]`, max 64, `auto` reserved,
-case-insensitive). A `/v1` request whose body `model` matches an alias is
-**pinned to that endpoint**: relay rewrites `model` to `model_override` (if
-set) or the endpoint's discovered default model before forwarding, so the
-client never needs to know what is actually running there. Alias-pinned
-requests do **not** fail over to other endpoints — the caller asked for that
-server by name. `model: "auto"` (or any non-alias value) uses the normal
-active-endpoint / priority-failover resolution.
+`alias` is a unique routing name (`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`,
+`auto` reserved, uniqueness checked case-insensitively). A `/v1` request whose
+body `model` matches an alias is **pinned to that endpoint**: relay rewrites
+`model` to `model_override` (if set) or the endpoint's discovered default
+before forwarding, so the client never needs to know what is actually running
+there. Alias-pinned requests do **not** fail over. `model: "auto"` (or any
+non-alias value) uses the normal pin / priority-failover resolution.
 
 `GET /v1/models` is synthesized by relay: it lists `auto` plus every enabled
-endpoint's alias (with `relay.endpoint`, `relay.health`,
-`relay.upstream_model` metadata), so OpenAI clients can discover the routing
+endpoint's alias, each carrying `relay.endpoint`, `relay.health`, and
+`relay.upstream_model` metadata, so OpenAI clients can discover the routing
 names.
 
-### Tunnel
+### Tunnel (structured, supervised)
 ```json
 {
   "id": "uuid", "name": "gpu-box", "ssh_host": "gpu-box.lan", "ssh_port": 22,
   "ssh_user": "sander", "key_path": "~/.ssh/id_ed25519",
   "remote_host": "127.0.0.1", "remote_port": 8000, "local_port": 8443,
-  "compress": true, "keepalive": true, "extra_opts": null,
+  "compress": true, "keepalive": true, "extra_opts": null, "enabled": false,
   "status": "stopped|starting|up|error", "pid": null,
   "last_error": null, "started_at": null, "uptime_s": 0
 }
 ```
 
+### Tunnel session (interactive, PTY-backed)
+```json
+{
+  "endpoint_id": "uuid", "status": "idle|connecting|awaiting_input|up|error|stopped",
+  "prompt": "sander@skynet's password:", "prompt_secret": true,
+  "output": ["…redacted recent terminal lines…"],
+  "last_error": null, "local_port": 9090, "pid": 41233, "uptime_s": 12.4
+}
+```
+
+One session per endpoint. Nothing autostarts. When `status` is
+`awaiting_input`, POST the answer to `.../respond`; `prompt_secret` means the
+UI should mask the field. Sessions for structured tunnels reuse the same
+manager under the key `t:<tunnel_id>`, and `endpoint_id` carries that key.
+
+### SSH config host
+```json
+{
+  "alias": "skynet", "hostname": "10.0.0.4", "user": "sander", "port": 22,
+  "identity_files": ["~/.ssh/id_ed25519"], "identity_file": "~/.ssh/id_ed25519",
+  "identity_explicit": true, "proxyjump": null
+}
+```
+Resolved by running `ssh -G <alias>` — the same resolution ssh itself
+performs. `identity_explicit` distinguishes "this host has a configured key"
+from "ssh will try every default key".
+
+### Tunnel route
+```json
+{
+  "id": "uuid", "endpoint_id": "uuid", "label": "via bastion",
+  "command": "ssh -N -L 9090:localhost:9090 skynet-alt",
+  "local_port": 9090, "active": false, "created_ts": 1780000000.0
+}
+```
+A saved candidate ssh command for an endpoint. Activating one copies its
+`command`/`local_port` onto the endpoint, so a flaky route can be swapped for
+a working one without touching the endpoint's alias or `base_url`.
+
 ### Settings
 ```json
 {
   "stream_passthrough": true, "queue_requests": true, "auto_failover": true,
-  "log_bodies": false, "allow_cors": true,
-  "inject_stream_usage": true,
-  "proxy_port": 4000, "retention_days": 30,
-  "restart_required": false
+  "log_bodies": false, "allow_cors": true, "inject_stream_usage": true,
+  "proxy_port": 4000, "retention_days": 30, "restart_required": false
 }
 ```
+`PUT` accepts any subset. `proxy_port` is persisted but only takes effect on
+restart, which is what `restart_required` reports.
 
 ### Request row (`/admin/stats/recent`)
 ```json
@@ -88,7 +153,8 @@ names.
   "cost_usd": 0.0, "temperature": 0.7, "max_tokens": 1024
 }
 ```
-In-flight requests appear with `state: "streaming"` and live `completion_tokens`.
+In-flight requests are prepended with `state: "streaming"`, live
+`completion_tokens`, and nulls for everything not yet known.
 
 ## Stats shapes
 
@@ -100,23 +166,42 @@ In-flight requests appear with `state: "streaming"` and live `completion_tokens`
 | `GET /admin/stats/tokens/by-hour` | `{dimensions:["hour","input","output"], source:[[0,…,…],…,[23,…,…]]}` (local time, summed across days in window) |
 | `GET /admin/stats/tokens/by-day` | `{dimensions:["date","input","output"], source:[["2026-07-01",…,…],…]}` |
 | `GET /admin/stats/by-model` | `{dimensions:["model","requests","tokens","cost","avg_tps","errors"], source:[…]}` |
-| `GET /admin/stats/by-endpoint` | `{dimensions:["endpoint","requests","input","output","errors","share"], source:[…]}` |
+| `GET /admin/stats/by-endpoint` | `{dimensions:["endpoint","requests","input","output","errors","share","endpoint_id"], source:[…]}` |
 | `GET /admin/stats/latency` | `{dimensions:["time","ttft_p50","ttft_p95","tps_p50"], source:[…]}` |
 | `GET /admin/stats/recent?limit=90` | `{rows:[RequestRow,…], counts:{all,streaming,done,error}}` |
 | `GET /admin/stats/live` | `{in_flight, max_concurrency, series:[[ts_ms,n],…]}` |
 
+Percentiles in `summary` are exact (computed from raw rows) for spans up to
+~24h and approximate (from stored histograms) for wider spans — see
+[architecture.md](architecture.md#storage-and-scale).
+
 ## Control-plane results
 
-- `POST /admin/endpoints/{id}/test` → `{ok, latency_ms, models[], error}`
-- `POST /admin/tunnels/{id}/test` → `{ssh_ok, ssh_latency_ms, endpoint_ok, endpoint_latency_ms, models[], error}`
-- `GET /admin/tunnels/{id}/command` → `{command: "ssh -N -C -L 8443:127.0.0.1:8000 -p 22 -i ~/.ssh/id_ed25519 -o … user@host"}`
-- `GET /admin/proxy` → `{base_url, port, api_key_masked, api_key, uptime_s, requests_total, active_clients}` (`api_key` full value only over localhost admin plane; dashboard uses it for the reveal/copy control)
-- `POST /admin/logs/frontend` accepts `{events:[{ts, level, event, detail?}]}` → `{accepted: n}`
+- `POST /admin/endpoints/{id}/test` → `{ok, latency_ms, models[], error}`.
+  The result is also fed into the health state machine as a probe signal.
+- `GET /admin/endpoints/health` → `{endpoints:[{id, name, health,
+  consecutive_fails, ewma_latency_ms, model}, …], resolved: "<endpoint id>"}`.
+- `GET/PUT /admin/router` → `{policy, pinned_id, resolved_id, resolved_name}`.
+- `POST /admin/endpoints/{eid}/routes/{rid}/test` → `{ok, latency_ms, error}`
+  (quick probe; does not open a real tunnel).
+- `POST /admin/tunnels/{id}/test` → `{ssh_ok, ssh_latency_ms, endpoint_ok,
+  endpoint_latency_ms, models[], error}`.
+- `GET /admin/tunnels/{id}/command` → `{command: "ssh -N -C -L 8443:127.0.0.1:8000 -p 22 -i ~/.ssh/id_ed25519 -o … user@host"}`.
+  Cosmetic rendering of the argv list that is actually executed.
+- `GET /admin/proxy` → `{base_url, port, api_key, api_key_masked, uptime_s,
+  requests_total, active_clients, db_size_bytes}`. `db_size_bytes` sums the
+  main DB plus its `-wal` and `-shm` files.
+- `POST /admin/proxy/key` → `{api_key, api_key_masked}` (regenerates).
+- `POST /admin/logs/frontend` accepts `{events:[{ts, level, event, detail?}]}`
+  (max 200 per batch) → `{accepted: n}`.
+- `GET /admin/logs/frontend?limit=100` → recent ingested UI events.
 
 ## Auth
 
-- Client plane `/v1/*`: `Authorization: Bearer <client key>` — only enforced
-  when one or more client keys are configured; the caller's key is validated
-  locally and **never forwarded**; the target endpoint's own key is injected.
-- Admin plane `/admin/*`: `X-Admin-Token` header, only enforced when
-  `RELAY_ADMIN_TOKEN` is set.
+- **Client plane `/v1/*`** — `Authorization: Bearer <client key>`, enforced
+  only when `RELAY_REQUIRE_CLIENT_KEY` is true. The caller's key is validated
+  locally against the stored proxy key and **never forwarded**; the target
+  endpoint's own key is injected instead. `Authorization` is in the
+  hop-by-hop strip list, so it cannot leak upstream even when auth is off.
+- **Admin plane `/admin/*`** — `X-Admin-Token` header, enforced only when
+  `RELAY_ADMIN_TOKEN` is set. Compared with `hmac.compare_digest`.
