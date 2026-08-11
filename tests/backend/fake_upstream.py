@@ -110,7 +110,7 @@ def make_opencode_upstream() -> tuple[FastAPI, dict]:
     calls = {
         "auth": None, "health": 0, "providers": 0, "created": 0,
         "deleted": 0, "aborted": 0, "messages": 0, "last_message": None,
-        "open_sessions": set(), "hang": False,
+        "open_sessions": set(), "hang": False, "empty_turn": False,
     }
 
     @up.get("/global/health")
@@ -148,6 +148,10 @@ def make_opencode_upstream() -> tuple[FastAPI, dict]:
         calls["last_message"] = {"session": sid, **body}
         if calls["hang"]:
             await asyncio.sleep(30)
+        if calls["empty_turn"]:
+            # What the real server returns for a modelID it does not serve:
+            # 200 with an empty object, no error anywhere.
+            return {}
         model = body.get("model") or {}
         return {
             "info": {

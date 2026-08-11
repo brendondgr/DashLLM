@@ -341,3 +341,24 @@ def test_finish_reason_falls_back_to_the_error_when_absent():
     from app.services.adapters.opencode import _finish_reason
     assert _finish_reason(None, "max output tokens reached") == "length"
     assert _finish_reason(None, "provider exploded") == "error"
+
+
+def test_empty_turn_is_an_error_not_an_empty_success(opencode_env):
+    """An unknown modelID gets a 200 with an empty body from the real server —
+    identical to what an invented id returns. Reporting that as a successful
+    completion would make a typo in the model allowlist look like a model that
+    simply had nothing to say."""
+    client, app, calls = opencode_env
+    _register_opencode(client)
+    calls["empty_turn"] = True
+
+    r = client.post("/v1/chat/completions", json={
+        "model": "agent", "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 502
+    msg = r.json()["error"]["message"]
+    assert "empty turn" in msg and "list-models" in msg
+    # the session is still cleaned up on the failure path
+    assert calls["deleted"] == 1 and calls["open_sessions"] == set()
+
+    row = _wait_rows(app, 1)[-1]
+    assert row["ok"] == 0 and row["status"] == 502

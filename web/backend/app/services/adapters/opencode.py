@@ -388,6 +388,17 @@ class OpenCodeAdapter(UpstreamAdapter):
             raise RetryableUpstreamError(
                 f"non-JSON reply from agent: {e}", status=502) from e
 
+        # An unknown modelID does not 4xx — OpenCode answers 200 with an empty
+        # body ({} with no info and no parts), byte-identical to what an
+        # invented model id returns. Left alone that becomes a "successful"
+        # completion with empty content and zero tokens, which is exactly the
+        # shape a typo in OPENCODE_MODELS produces. Fail loudly instead.
+        if not data.get("info") and not data.get("parts"):
+            raise RetryableUpstreamError(
+                f"agent returned an empty turn for model {record.model!r} — "
+                "that model id is probably not served by this OpenCode "
+                "instance (check ./launch.sh --list-models)", status=502)
+
         return self._to_completion(data, record)
 
     async def _teardown(self, http: httpx.AsyncClient, base: str,
