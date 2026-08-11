@@ -319,3 +319,25 @@ def test_hung_turn_times_out_and_aborts_the_session(opencode_env, monkeypatch):
 
     row = _wait_rows(app, 1)[-1]
     assert row["status"] == 504 and row["ok"] == 0
+
+
+# ---- finish reasons ------------------------------------------------------
+@pytest.mark.parametrize("finish,expected", [
+    ("stop", "stop"),
+    ("length", "length"),
+    ("tool-calls", "tool_calls"),
+    ("content-filter", "content_filter"),
+    ("error", "error"),
+    ("something-new", "stop"),   # unknown -> lossy but true, never invented
+    (None, "stop"),
+])
+def test_finish_reason_mapping(finish, expected):
+    """`info.finish` uses the AI SDK's vocabulary, not OpenAI's."""
+    from app.services.adapters.opencode import _finish_reason
+    assert _finish_reason(finish, None) == expected
+
+
+def test_finish_reason_falls_back_to_the_error_when_absent():
+    from app.services.adapters.opencode import _finish_reason
+    assert _finish_reason(None, "max output tokens reached") == "length"
+    assert _finish_reason(None, "provider exploded") == "error"

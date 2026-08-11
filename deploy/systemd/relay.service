@@ -19,6 +19,10 @@ Environment=PYTHONUNBUFFERED=1
 # Persist runtime state (registered endpoints, telemetry) under the repo.
 Environment=RELAY_DB_PATH=%h/Tools/DashLLM/web/backend/data/relay.db
 Environment=RELAY_LOG_DIR=%h/Tools/DashLLM/web/backend/logs
+# Same .env launch.sh reads, so the service and the script agree on
+# RELAY_REQUIRE_CLIENT_KEY / RELAY_ADMIN_TOKEN. Leading `-` = optional.
+# Note: ExecStart's --port above is fixed; RELAY_PORT in .env does not move it.
+EnvironmentFile=-%h/Tools/DashLLM/.env
 
 [Install]
 WantedBy=default.target

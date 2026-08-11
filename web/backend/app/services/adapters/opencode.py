@@ -163,6 +163,27 @@ def catalog_models(payload: dict) -> list[str]:
     return out
 
 
+# `info.finish` carries the Vercel AI SDK's finishReason vocabulary, which is
+# close to OpenAI's but not identical. Anything unrecognized is reported as
+# "stop": a made-up finish_reason is worse than a slightly lossy true one.
+_FINISH_REASONS = {
+    "stop": "stop",
+    "length": "length",
+    "tool-calls": "tool_calls",
+    "content-filter": "content_filter",
+    "error": "error",
+}
+
+
+def _finish_reason(finish, error) -> str:
+    mapped = _FINISH_REASONS.get(str(finish).lower()) if finish else None
+    if mapped:
+        return mapped
+    if error:
+        return "length" if "output" in str(error).lower() else "error"
+    return "stop"
+
+
 def extract_text(parts: list) -> tuple[str, list[str]]:
     """Assistant parts -> (visible text, tool names used).
 
@@ -415,9 +436,7 @@ class OpenCodeAdapter(UpstreamAdapter):
             record.model = f"{provider_id}/{model_id}"
 
         error = info.get("error")
-        finish = "stop"
-        if error:
-            finish = "length" if "output" in str(error).lower() else "error"
+        finish = _finish_reason(info.get("finish"), error)
 
         usage = {
             "prompt_tokens": prompt_tokens or 0,

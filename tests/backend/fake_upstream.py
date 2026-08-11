@@ -100,9 +100,11 @@ def make_opencode_upstream() -> tuple[FastAPI, dict]:
     """A fake ``opencode serve``: Basic auth, provider catalog, and the
     session -> message -> delete lifecycle the adapter drives.
 
-    Shapes mirror what the real server returns (``{info, parts}`` with usage on
-    ``info.tokens`` and a pre-priced ``info.cost``), so the adapter's
-    translation is exercised, not a convenient stand-in for it.
+    Shapes are copied from a live ``opencode serve`` 1.17.13 (``{info, parts}``
+    with usage on ``info.tokens``, a pre-priced ``info.cost``, an ``info.finish``
+    reason, and step-start/step-finish parts around the content), so the
+    adapter's translation is exercised against reality rather than a convenient
+    stand-in for it.
     """
     up = FastAPI()
     calls = {
@@ -153,13 +155,20 @@ def make_opencode_upstream() -> tuple[FastAPI, dict]:
                 "providerID": model.get("providerID", "anthropic"),
                 "modelID": model.get("modelID", "claude-sonnet-4-5"),
                 "cost": 0.00123,
-                "tokens": {"input": 11, "output": 4, "reasoning": 2,
-                           "cache": {"read": 0, "write": 0}},
+                "finish": "stop",
+                "tokens": {"total": 17, "input": 11, "output": 4,
+                           "reasoning": 2, "cache": {"read": 0, "write": 0}},
+                "time": {"created": 1786467497345, "completed": 1786467498301},
             },
+            # Part sequence observed from opencode 1.17.13: step-start and
+            # step-finish bracket the real content and must be ignored.
             "parts": [
+                {"type": "step-start"},
+                {"type": "reasoning", "text": "thinking"},
                 {"type": "text", "text": "agent says hi"},
                 {"type": "tool", "tool": "bash", "state": {"status": "done"}},
                 {"type": "text", "text": " and done"},
+                {"type": "step-finish"},
             ],
         }
 

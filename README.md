@@ -11,6 +11,10 @@ records per-request telemetry rendered as Apache ECharts visualizations.
 - **Remote hosting** — interactive SSH tunnels run in a real pseudo-terminal,
   so host-key confirmations, passphrases, and password prompts are answered
   in the dashboard. Nothing connects on its own.
+- **Agent upstreams** — an [OpenCode](https://opencode.ai) server can be
+  registered as an endpoint; relay translates OpenAI chat requests into agent
+  sessions, with per-endpoint model allowlists so each provider model is
+  individually addressable. See [docs/opencode.md](docs/opencode.md).
 - **Dashboard** — Astro + React + ECharts, fed by an ECharts-shaped stats API
   (`dimensions`/`source` payloads) backed by hourly rollups.
 
@@ -24,6 +28,17 @@ Point any OpenAI client at `http://127.0.0.1:4000/v1`. Build the dashboard
 once (`cd web/frontend && npm install && npm run build`) and the same process
 serves it at `http://127.0.0.1:4000/`.
 
+To bring relay up **together with an OpenCode agent server** — both processes,
+credentials, ports, and the agent endpoint registered automatically, all from
+one file:
+
+```bash
+cp .env.example .env && ./launch.sh
+```
+
+Edit `.env` first (`OPENCODE_SERVER_PASSWORD` at minimum);
+`./launch.sh --list-models` prints the model ids your OpenCode server offers.
+
 For frontend work, run both dev servers instead — Astro on `:4321` proxies
 `/admin`, `/v1`, and `/health` to the backend on `:4000`:
 
@@ -35,8 +50,10 @@ For frontend work, run both dev servers instead — Astro on `:4321` proxies
 
 ```text
 root/
+├── launch.sh                # relay + opencode together, configured from .env
+├── .env.example             # template for .env (gitignored)
 ├── docs/                    # architecture, api-contract, routes, data-flow,
-│                            # frontend, deployment
+│                            # frontend, deployment, opencode
 ├── web/
 │   ├── backend/             # FastAPI service (uv project)
 │   │   ├── app/
@@ -63,7 +80,7 @@ root/
 │       │   └── hooks/       # usePoll
 │       ├── astro.config.mjs
 │       └── package.json
-├── tests/backend/           # pytest suite (91 tests)
+├── tests/backend/           # pytest suite (133 tests)
 ├── utils/                   # seed_telemetry.py
 ├── scripts/                 # dev.sh, relay, install-systemd.sh, validate_live.sh
 └── deploy/systemd/          # relay.service (systemd user unit)

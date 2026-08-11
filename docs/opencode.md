@@ -32,10 +32,53 @@ keeps no agent state.
 
 ## Setting one up
 
+### The short way: `./launch.sh`
+
+From the repo root, one file configures both servers and registers the
+endpoint:
+
+```bash
+cp .env.example .env
+```
+
+Set `OPENCODE_SERVER_PASSWORD` (required), and usually `OPENCODE_PROJECT_DIR`
+— `opencode serve` binds to one directory and its `bash`/`edit`/`write` tools
+act there, so it defaults to this repo, which is rarely what you want. Then:
+
+```bash
+./launch.sh
+```
+
+It starts `opencode serve`, starts relay, waits for both to answer, and
+creates or updates the relay endpoint from `.env` — idempotent, so re-running
+after an edit converges rather than duplicating. Ctrl-C stops both. To fill in
+`OPENCODE_MODELS`, ask the server what it has:
+
+```bash
+./launch.sh --list-models
+```
+
+If relay is already running as a systemd service on the same port, `launch.sh`
+says so; `./launch.sh --takeover` stops the service first. The service reads
+the same `.env` (via `EnvironmentFile`), so `relay start` and `./launch.sh`
+agree on `RELAY_REQUIRE_CLIENT_KEY` and `RELAY_ADMIN_TOKEN` — but the unit's
+`ExecStart` pins its own `--port`, so `RELAY_PORT` only moves the port for
+`launch.sh`. Re-run `./scripts/install-systemd.sh` after pulling this change.
+
+To register an endpoint against an already-running relay without launching
+anything:
+
+```bash
+set -a; . ./.env; set +a; python3 scripts/register_opencode.py
+```
+
+### The manual way
+
 1. Start the server in the project you want the agent to work in:
 
    ```bash
-   opencode serve --port 4096
+   OPENCODE_SERVER_USERNAME=me OPENCODE_SERVER_PASSWORD=s3cret \
+     opencode serve --port 4096
    ```
 
 2. In the dashboard, **Endpoints → + Add endpoint**:
