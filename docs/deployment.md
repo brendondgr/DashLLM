@@ -143,6 +143,16 @@ Put the output in `RELAY_ADMIN_PASSWORD_HASH`. Relay **refuses to start** on a
 non-loopback bind with no admin credential configured — a misconfigured public
 deploy fails loudly at boot instead of quietly serving your upstream keys.
 
+`RELAY_ADMIN_TOKEN` also satisfies that check, but it is a credential for
+*scripts* only: it authenticates an `X-Admin-Token` header, and a browser has
+no way to send one. A token-only config boots and warns that dashboard login
+is unavailable. Set the password hash as well if you want to sign in.
+
+**Upgrading an existing deployment:** if you already run with
+`RELAY_HOST=0.0.0.0` and no admin credential, relay will not start after this
+change until you set one — systemd retries, and every request during the loop
+is refused. Set the hash before restarting.
+
 ### Decide who may register
 
 `RELAY_SIGNUP_CODE` is empty by default, which disables signup entirely. Set

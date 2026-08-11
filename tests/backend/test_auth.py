@@ -276,6 +276,24 @@ def test_public_bind_without_admin_credential_refuses_to_start(tmp_path):
         create_app(cfg)
 
 
+def test_token_only_config_cannot_log_in_to_the_dashboard(tmp_path, caplog):
+    """A token satisfies the boot check but is not a login credential — the
+    browser has no way to send it. Booting must say so out loud."""
+    cfg = Config(host="0.0.0.0", db_path=tmp_path / "t.db",
+                 log_dir=tmp_path / "logs", frontend_dist=tmp_path / "nd",
+                 probe_interval=9999, admin_token="s3kr1t", cookie_secure=False)
+    with caplog.at_level("WARNING"):
+        app = create_app(cfg)
+    assert any("dashboard login is unavailable" in r.message
+               for r in caplog.records)
+    with TestClient(app) as c:
+        r = c.post("/auth/login",
+                   json={"username": "admin", "password": "s3kr1t"})
+        assert r.status_code == 401, "the token is not a password"
+        assert c.get("/admin/settings",
+                     headers={"X-Admin-Token": "s3kr1t"}).status_code == 200
+
+
 def test_public_bind_with_admin_credential_starts(tmp_path):
     cfg = Config(host="0.0.0.0", db_path=tmp_path / "t.db",
                  log_dir=tmp_path / "logs", frontend_dist=tmp_path / "nd",

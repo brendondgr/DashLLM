@@ -121,13 +121,26 @@ def _check_auth_config(cfg: Config) -> None:
     if not admin_configured(cfg) and not is_loopback_bind(cfg):
         raise RuntimeError(
             f"refusing to start: RELAY_HOST={cfg.host} is publicly reachable"
-            " but no admin credential is set. Set RELAY_ADMIN_PASSWORD_HASH"
-            " (uv run python -m app.services.users hash '<password>') or"
-            " RELAY_ADMIN_TOKEN.")
+            " but no admin credential is set. Generate one with:\n"
+            "    cd web/backend && uv run python -m app.services.users hash"
+            " '<password>'\n"
+            "then put it in .env as RELAY_ADMIN_PASSWORD_HASH=... and"
+            " restart. (RELAY_ADMIN_TOKEN also satisfies this check, but it"
+            " only authenticates scripts sending X-Admin-Token — a browser"
+            " cannot log in with it.)")
     if cfg.admin_password and not cfg.admin_password_hash:
         log.warning(
             "RELAY_ADMIN_PASSWORD is stored in plaintext; prefer"
             " RELAY_ADMIN_PASSWORD_HASH")
+    # A token-only config boots and serves the API, but nobody can sign in to
+    # the dashboard: the login form checks the password/hash, and a browser
+    # has no way to send X-Admin-Token. Legitimate for a headless deployment,
+    # a surprise for anyone who set the token to get past the boot check.
+    if cfg.admin_token and not (cfg.admin_password_hash or cfg.admin_password):
+        log.warning(
+            "RELAY_ADMIN_TOKEN is set but no admin password is: scripts can"
+            " reach /admin with X-Admin-Token, but dashboard login is"
+            " unavailable. Set RELAY_ADMIN_PASSWORD_HASH to sign in.")
     if not cfg.cookie_secure and not is_loopback_bind(cfg):
         log.warning(
             "RELAY_COOKIE_SECURE=0 on a public bind: session cookies will be"
