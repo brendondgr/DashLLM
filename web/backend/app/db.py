@@ -57,6 +57,13 @@ CREATE TABLE IF NOT EXISTS endpoints (
   alias          TEXT,
   kind           TEXT NOT NULL DEFAULT 'local',
   server_type    TEXT DEFAULT 'openai',
+  -- Wire protocol the upstream speaks; the adapter dispatch key. Unlike
+  -- `kind` (topology, re-derived on every PATCH) and `server_type`
+  -- (cosmetic badge), nothing else writes this.
+  protocol       TEXT NOT NULL DEFAULT 'openai',
+  -- JSON array of model ids this endpoint is allowed to serve, or NULL for
+  -- "whatever it advertises". Read through router.available_models.
+  available_models TEXT,
   base_url       TEXT NOT NULL,
   upstream_key   TEXT,
   tunnel_id      TEXT,
@@ -180,6 +187,13 @@ class Database:
         if "active_tunnel_route_id" not in cols:
             self._conn.execute(
                 "ALTER TABLE endpoints ADD COLUMN active_tunnel_route_id TEXT")
+        if "protocol" not in cols:
+            self._conn.execute(
+                "ALTER TABLE endpoints ADD COLUMN protocol TEXT NOT NULL"
+                " DEFAULT 'openai'")
+        if "available_models" not in cols:
+            self._conn.execute(
+                "ALTER TABLE endpoints ADD COLUMN available_models TEXT")
         # Backfill: an endpoint that already had a tunnel_command before
         # routes existed becomes its own "default" route, so upgrades don't
         # lose the working ssh command.

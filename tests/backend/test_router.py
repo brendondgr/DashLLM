@@ -132,3 +132,108 @@ def test_state_survives_reload(router, db):
     assert set(fresh.endpoints) == {a["id"], b["id"]}
     assert fresh.pinned_id == b["id"]
     assert fresh.policy == "priority"
+
+
+# ---- protocol: alias-only routing ----------------------------------------
+def _oc(name: str, **extra) -> EndpointCreate:
+    return EndpointCreate(
+        name=name, base_url="http://opencode", protocol="opencode",
+        server_type="opencode", **extra)
+
+
+def test_opencode_never_wins_auto_or_failover(router):
+    openai_ep = router.create(_ep("a"))
+    agent = router.create(_oc("agent", alias="agent"))
+    # not eligible for `auto`, and not a failover target once the OpenAI one
+    # is excluded — an agent server is only ever reached by name.
+    assert router.resolve()["id"] == openai_ep["id"]
+    assert router.resolve(exclude={openai_ep["id"]}) is None
+    # ...but it is still reachable through its alias.
+    assert router.resolve_alias("agent")["id"] == agent["id"]
+
+
+def test_opencode_is_not_auto_pinned_as_the_first_endpoint(router):
+    agent = router.create(_oc("agent", alias="agent"))
+    assert router.pinned_id is None
+    assert router.resolve() is None
+    openai_ep = router.create(_ep("a"))
+    assert router.pinned_id == openai_ep["id"]
+    assert agent["protocol"] == "opencode"
+
+
+def test_pinning_an_opencode_endpoint_does_not_capture_auto(router):
+    openai_ep = router.create(_ep("a"))
+    agent = router.create(_oc("agent", alias="agent"))
+    router.activate(agent["id"])
+    assert router.resolve()["id"] == openai_ep["id"]
+
+
+# ---- available_models allowlist -------------------------------------------
+def test_allowlist_round_trips_and_routes(router):
+    ep = router.create(_oc("agent", alias="agent", available_models=[
+        "anthropic/claude-sonnet-4-5", "openai/gpt-5"]))
+    assert router.available_models(ep["id"]) == [
+        "anthropic/claude-sonnet-4-5", "openai/gpt-5"]
+    row, exact = router.resolve_request_model("openai/gpt-5")
+    assert row["id"] == ep["id"] and exact == "openai/gpt-5"
+    # an alias match reports no exact model: the endpoint chooses
+    row, exact = router.resolve_request_model("agent")
+    assert row["id"] == ep["id"] and exact is None
+    assert router.resolve_request_model("nope") == (None, None)
+
+
+def test_allowlist_survives_reload(router, db):
+    router.create(_oc("agent", alias="agent",
+                      available_models=["openai/gpt-5"]))
+    reloaded = Router(db)
+    eid = next(iter(reloaded.endpoints))
+    assert reloaded.available_models(eid) == ["openai/gpt-5"]
+
+
+def test_allowlist_rejects_collisions(router):
+    router.create(_ep("a", url="http://127.0.0.1:7070/v1"))
+    router.create(_oc("agent", alias="agent",
+                      available_models=["openai/gpt-5"]))
+    with pytest.raises(ValueError, match="already served"):
+        router.create(_oc("other", alias="other",
+                          available_models=["openai/gpt-5"]))
+    with pytest.raises(ValueError, match="already the alias"):
+        router.create(_oc("other", alias="other",
+                          available_models=["agent"]))
+    with pytest.raises(ValueError, match="reserved"):
+        router.create(_oc("other", alias="other", available_models=["auto"]))
+    with pytest.raises(ValueError, match="routing name"):
+        router.create(_oc("other", alias="other",
+                          available_models=["has space"]))
+
+
+def test_allowlist_dedupes_and_can_be_cleared(router):
+    ep = router.create(_oc("agent", alias="agent", available_models=[
+        "openai/gpt-5", "openai/gpt-5", " openai/gpt-5 "]))
+    assert router.available_models(ep["id"]) == ["openai/gpt-5"]
+    router.patch(ep["id"], EndpointPatch(available_models=[]))
+    assert router.available_models(ep["id"]) == []
+
+
+def test_allowlist_narrows_discovered_models_immediately(router):
+    ep = router.create(_oc("agent", alias="agent"))
+    router.set_models(ep["id"], ["a/one", "a/two", "a/three"])
+    assert router.state[ep["id"]].model == "a/one"
+
+    router.patch(ep["id"], EndpointPatch(available_models=["a/three"]))
+    st = router.state[ep["id"]]
+    assert st.models == ["a/three"] and st.model == "a/three"
+    assert st.discovered == ["a/one", "a/two", "a/three"]
+
+    # clearing it restores the full discovered list without re-probing
+    router.patch(ep["id"], EndpointPatch(available_models=[]))
+    assert router.state[ep["id"]].model == "a/one"
+
+
+def test_allowlisted_model_the_probe_missed_is_still_offered(router):
+    """A provider catalog can lag what the provider will actually serve, so an
+    operator's explicit list is not silently emptied by a stale probe."""
+    ep = router.create(_oc("agent", alias="agent",
+                           available_models=["anthropic/brand-new"]))
+    router.set_models(ep["id"], ["anthropic/old-one"])
+    assert router.state[ep["id"]].models == ["anthropic/brand-new"]

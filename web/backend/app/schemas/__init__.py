@@ -5,7 +5,10 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 EndpointKind = Literal["local", "remote_direct", "remote_tunnel"]
-ServerType = Literal["llama.cpp", "vLLM", "ollama", "openai"]
+ServerType = Literal["llama.cpp", "vLLM", "ollama", "openai", "opencode"]
+# Wire protocol the upstream speaks. Dispatches services/adapters/; the only
+# field any backend code branches on to decide how to talk to a server.
+Protocol = Literal["openai", "opencode"]
 Health = Literal["healthy", "degraded", "failed", "unknown"]
 RouterPolicy = Literal["manual", "priority"]
 
@@ -17,6 +20,12 @@ class EndpointCreate(BaseModel):
     alias: str | None = Field(default=None, max_length=64)
     kind: EndpointKind | None = None  # inferred from URL when omitted
     server_type: ServerType = "openai"
+    protocol: Protocol = "openai"
+    # Explicit allowlist of model ids this endpoint serves. Clients may send
+    # any of them as "model" to reach this endpoint with that exact model, and
+    # they are advertised through GET /v1/models. Empty = advertise nothing
+    # extra and use whatever the endpoint reports.
+    available_models: list[str] = Field(default_factory=list, max_length=200)
     upstream_key: str | None = None
     tunnel_id: str | None = None
     # Interactive SSH tunnel: a raw `ssh -N -L ...` command run on demand.
@@ -34,6 +43,8 @@ class EndpointPatch(BaseModel):
     alias: str | None = None
     kind: EndpointKind | None = None
     server_type: ServerType | None = None
+    protocol: Protocol | None = None
+    available_models: list[str] | None = Field(default=None, max_length=200)
     upstream_key: str | None = None
     tunnel_id: str | None = None
     tunnel_command: str | None = None
@@ -50,6 +61,8 @@ class EndpointOut(BaseModel):
     alias: str | None = None
     kind: EndpointKind
     server_type: ServerType
+    protocol: Protocol = "openai"
+    available_models: list[str] = []
     base_url: str
     has_key: bool
     tunnel_id: str | None

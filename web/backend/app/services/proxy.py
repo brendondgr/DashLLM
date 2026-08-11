@@ -1,6 +1,9 @@
 """The OpenAI-compatible forwarding hot path.
 
 - resolves the upstream from live router state at call time
+- dispatches the actual attempt through the endpoint's protocol adapter
+  (``services/adapters/``); everything around it — the concurrency gate,
+  alias pinning, failover, telemetry — is protocol-agnostic and lives here
 - strips caller auth, injects the target endpoint's upstream key
 - non-streaming: captures usage from the JSON body, returns it verbatim
 - streaming: tees raw SSE bytes to the client unchanged while stamping TTFT
@@ -23,16 +26,16 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from app.core.logging import get_logger
 from app.security import extract_bearer, mask_key
+from app.services.adapters import (
+    HOP_BY_HOP as _HOP_BY_HOP,
+    RetryableUpstreamError as _RetryableUpstreamError,
+    StaleModelOverride as _StaleModelOverride,
+    get_adapter,
+)
 from app.services.telemetry import RequestRecord
 
 log = get_logger("proxy")
 
-# Hop-by-hop headers never forwarded either direction.
-_HOP_BY_HOP = {
-    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
-    "te", "trailers", "transfer-encoding", "upgrade", "host",
-    "content-length", "authorization", "x-admin-token",
-}
 _BODY_LIMIT = 100_000  # chars kept per body when log_bodies is on
 _TAIL_LIMIT = 65_536  # bytes of SSE tail kept for usage parsing
 
@@ -136,21 +139,25 @@ class ProxyService:
         body_bytes = await request.body()
         body_json = self._parse_json(body_bytes)
 
-        # Model-alias routing: a request whose "model" matches an endpoint
-        # alias is pinned to that endpoint; the model field is rewritten to
-        # what that server actually runs (override or discovered).
+        # Model routing: a request whose "model" names an endpoint alias, or a
+        # model in an endpoint's declared allowlist, is pinned to that
+        # endpoint. An alias is rewritten to whatever that server actually
+        # runs; an allowlisted model id is already real and goes through as-is.
         alias_endpoint: dict | None = None
+        pinned_model: str | None = None
         requested_model = (body_json or {}).get("model")
         if requested_model and requested_model != "auto":
-            alias_endpoint = self.router.resolve_alias(requested_model)
+            alias_endpoint, pinned_model = self.router.resolve_request_model(
+                requested_model)
             if alias_endpoint is not None and body_json is not None:
-                upstream_model = self.router.upstream_model(
+                upstream_model = pinned_model or self.router.upstream_model(
                     alias_endpoint["id"])
                 if upstream_model:
                     body_json["model"] = upstream_model
                 log.info("alias route", extra={"data": {
                     "id": req_id, "alias": requested_model,
                     "endpoint": alias_endpoint["name"],
+                    "exact_model": pinned_model is not None,
                     "upstream_model": upstream_model or requested_model}})
 
         want_stream = bool(body_json.get("stream")) if body_json else False
@@ -206,7 +213,8 @@ class ProxyService:
                 response = await self._dispatch(
                     request, path, record, body_bytes, t0,
                     force_endpoint=alias_endpoint,
-                    body_json=dispatch_body_json)
+                    body_json=dispatch_body_json,
+                    pinned_model=pinned_model)
             # A streaming response stays in-flight until its stream ends; the
             # tee generator calls live.finish() itself. Everything else (a
             # buffered body or an error response) is done now.
@@ -226,40 +234,65 @@ class ProxyService:
             return None
 
     def _models_catalog(self) -> JSONResponse:
-        """Synthesized /v1/models: "auto" + every enabled endpoint alias, so
-        OpenAI clients can discover the routing names (skynet, local, ...)."""
+        """Synthesized /v1/models: "auto", every enabled endpoint alias, and
+        every model an endpoint declares in its allowlist — so an OpenAI client
+        discovers both the routing names (skynet, local, ...) and the concrete
+        models it can ask for by name (anthropic/claude-sonnet-4-5, ...).
+
+        Everything listed here is routable: sending any of these ids back as
+        "model" reaches the endpoint that advertised it.
+        """
         created = int(time.time())
         data = [{"id": "auto", "object": "model", "created": created,
                  "owned_by": "relay",
                  "relay": {"routing": "active endpoint (hot-swap)"}}]
         for row in self.router.endpoints.values():
-            if not row.get("alias") or not row["enabled"]:
+            if not row["enabled"]:
                 continue
             st = self.router.state.get(row["id"])
-            data.append({
-                "id": row["alias"], "object": "model", "created": created,
-                "owned_by": f"relay:{row['name']}",
-                "relay": {
-                    "endpoint": row["name"],
-                    "health": st.health if st else "unknown",
-                    "upstream_model": self.router.upstream_model(row["id"]),
-                },
-            })
+            health = st.health if st else "unknown"
+            if row.get("alias"):
+                data.append({
+                    "id": row["alias"], "object": "model", "created": created,
+                    "owned_by": f"relay:{row['name']}",
+                    "relay": {
+                        "endpoint": row["name"], "health": health,
+                        "protocol": row.get("protocol") or "openai",
+                        "upstream_model": self.router.upstream_model(
+                            row["id"]),
+                    },
+                })
+            for model in self.router.available_models(row["id"]):
+                data.append({
+                    "id": model, "object": "model", "created": created,
+                    "owned_by": f"relay:{row['name']}",
+                    "relay": {
+                        "endpoint": row["name"], "health": health,
+                        "protocol": row.get("protocol") or "openai",
+                        "upstream_model": model,
+                    },
+                })
         return JSONResponse({"object": "list", "data": data})
 
     # ---- forwarding with pre-first-byte failover -------------------------
     async def _dispatch(self, request: Request, path: str,
                         record: RequestRecord, body: bytes,
                         t0: float, force_endpoint: dict | None = None,
-                        body_json: dict | None = None) -> Response:
+                        body_json: dict | None = None,
+                        pinned_model: str | None = None) -> Response:
         settings = self.settings.current
 
         def body_for(endpoint: dict) -> bytes:
             """Rewrite model=auto to the endpoint's real model (failover may
-            pick endpoints running different models, so this is per-attempt)."""
+            pick endpoints running different models, so this is per-attempt).
+
+            ``pinned_model`` — the caller named a model from the endpoint's
+            allowlist — short-circuits that: it is already a real id and
+            outranks the endpoint's model_override."""
             if body_json is None:
                 return body
-            upstream_model = self.router.upstream_model(endpoint["id"])
+            upstream_model = pinned_model or self.router.upstream_model(
+                endpoint["id"])
             if not upstream_model:
                 return body
             record.model = upstream_model
@@ -374,45 +407,32 @@ class ProxyService:
     async def _forward(self, request: Request, endpoint: dict, path: str,
                        record: RequestRecord, body: bytes,
                        t0: float) -> Response:
-        url = endpoint["base_url"] + "/" + path.lstrip("/")
-        headers = {
-            k: v for k, v in request.headers.items()
-            if k.lower() not in _HOP_BY_HOP
-        }
-        if endpoint.get("upstream_key"):
-            headers["Authorization"] = f"Bearer {endpoint['upstream_key']}"
+        adapter = get_adapter(endpoint)
 
-        upstream_req = self.http.build_request(
-            request.method, url, headers=headers,
-            content=body if body else None)
+        # A protocol that can't serve this route says so once, here — better
+        # than forwarding into a shape the upstream has no handler for and
+        # surfacing whatever 404 it happens to return.
+        if not adapter.supports(record.route):
+            record.status = 501
+            record.ok = False
+            record.error = f"{adapter.name} endpoint does not serve {record.route}"
+            record.latency_ms = (time.perf_counter() - t0) * 1000
+            self.telemetry.submit(record)
+            return _upstream_error(
+                501, f"endpoint {endpoint['name']!r} speaks {adapter.name}, "
+                f"which does not implement {record.route}")
 
         log.info("forwarding", extra={"data": {
             "id": record.id, "route": record.route, "method": request.method,
             "endpoint": endpoint["name"], "model": record.model,
-            "stream": record.stream}})
+            "protocol": adapter.name, "stream": record.stream}})
         # Now that an endpoint is chosen (post-alias/failover), reflect it on
         # the in-flight row so the live Requests view shows where it's going.
         self.live.update(record.id, {
             "endpoint_name": endpoint["name"], "model": record.model})
 
-        try:
-            resp = await self.http.send(upstream_req, stream=True)
-        except httpx.HTTPError as e:
-            raise _RetryableUpstreamError(f"{type(e).__name__}: {e}") from e
-
-        if resp.status_code >= 500:
-            text = (await resp.aread())[:1000]
-            await resp.aclose()
-            if self._is_stale_override(endpoint, record, text):
-                raise _StaleModelOverride(endpoint["model_override"])
-            raise _RetryableUpstreamError(
-                f"HTTP {resp.status_code}: {text[:300].decode(errors='replace')}",
-                status=resp.status_code)
-
-        if record.stream and resp.headers.get(
-                "content-type", "").startswith("text/event-stream"):
-            return self._stream_response(resp, endpoint, record, t0)
-        return await self._buffered_response(resp, endpoint, record, t0)
+        return await adapter.forward(
+            self, request, endpoint, path, record, body, t0)
 
     # ---- non-streaming --------------------------------------------------
     async def _buffered_response(self, resp: httpx.Response, endpoint: dict,
@@ -465,6 +485,40 @@ class ProxyService:
         }
         return Response(content=content, status_code=resp.status_code,
                         headers=headers)
+
+    # ---- adapter-produced replies ----------------------------------------
+    def finalize_adapter_response(
+            self, endpoint: dict, record: RequestRecord, t0: float,
+            status: int, payload: dict, cost_usd: float | None = None) -> None:
+        """Telemetry + router signals for a reply an adapter assembled itself.
+
+        The non-passthrough protocols never produce an ``httpx.Response``, so
+        they can't go through ``_buffered_response`` — but the recording side
+        of a request must stay identical across protocols or the dashboard
+        would show different columns depending on the upstream. This is that
+        shared call site.
+        """
+        record.status = status
+        record.ok = status < 400
+        record.latency_ms = (time.perf_counter() - t0) * 1000
+        if record.completion_tokens and record.latency_ms:
+            record.tokens_per_sec = round(
+                record.completion_tokens / (record.latency_ms / 1000), 2)
+        if self.settings.current.log_bodies and record.completion_body is None:
+            try:
+                record.completion_body = json.dumps(
+                    [c.get("message") for c in payload.get("choices", [])]
+                )[:_BODY_LIMIT]
+            except (TypeError, ValueError):
+                pass
+        record.cost_usd = self._cost(record, cost_usd)
+        self.telemetry.submit(record)
+        if record.ok:
+            self.router.report_success(
+                endpoint["id"], latency_ms=record.latency_ms)
+        else:
+            self.router.report_failure(
+                endpoint["id"], record.error or f"HTTP {status}")
 
     # ---- streaming (SSE tee) ---------------------------------------------
     def _stream_response(self, resp: httpx.Response, endpoint: dict,
@@ -546,7 +600,13 @@ class ProxyService:
             "tokens_per_sec": record.tokens_per_sec, "error": error}})
 
     # ---- pricing ----------------------------------------------------------
-    def _cost(self, record: RequestRecord) -> float:
+    def _cost(self, record: RequestRecord,
+              upstream_cost: float | None = None) -> float:
+        # An upstream that prices the turn itself (OpenCode reports USD on
+        # info.cost) is authoritative — it knows the real provider rates,
+        # relay only has a static table. Never overwrite it.
+        if upstream_cost is not None:
+            return upstream_cost
         prices = getattr(self.settings, "prices", {}) or {}
         entry = prices.get(record.model or "")
         if not entry:
@@ -554,19 +614,3 @@ class ProxyService:
         pt = record.prompt_tokens or 0
         ct = record.completion_tokens or 0
         return round(pt / 1e6 * entry[0] + ct / 1e6 * entry[1], 6)
-
-
-class _RetryableUpstreamError(Exception):
-    def __init__(self, message: str, status: int | None = None):
-        super().__init__(message)
-        self.status = status
-
-
-class _StaleModelOverride(Exception):
-    """Upstream rejected the endpoint's pinned model_override as unknown — the
-    model on that port was swapped out. Signals the dispatch layer to clear
-    the override and retry the same endpoint with the discovered model."""
-
-    def __init__(self, model: str):
-        super().__init__(model)
-        self.model = model

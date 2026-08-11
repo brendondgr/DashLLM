@@ -14,6 +14,7 @@ HEALTHY ──fails ≥ N──▶ DEGRADED ──fails keep coming──▶ FAI
    └────────── M consecutive probe successes ◀────────────┘
 """
 
+import json
 import re
 import time
 import uuid
@@ -29,7 +30,31 @@ log = get_logger("router")
 _POLICY_KEY = "router_policy"
 _PINNED_KEY = "router_pinned"
 _ALIAS_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+# Model ids are upstream-owned names, so this is looser than the alias rule:
+# it must admit "anthropic/claude-sonnet-4-5" and "qwen3:30b" as written.
+_MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,127}$")
 _RESERVED_ALIASES = {"auto"}
+
+
+def parse_models(value) -> list[str]:
+    """Read an ``available_models`` cell. Stored as a JSON array; tolerates
+    NULL and (from a hand-edited DB) a plain comma-separated string."""
+    if not value:
+        return []
+    if isinstance(value, list):
+        return [str(m) for m in value]
+    try:
+        parsed = json.loads(value)
+    except (json.JSONDecodeError, TypeError):
+        return [p.strip() for p in str(value).split(",") if p.strip()]
+    if isinstance(parsed, list):
+        return [str(m) for m in parsed]
+    return []
+
+
+def _models_json(models: list[str]) -> str | None:
+    """Storage form: a JSON array, or NULL when the allowlist is empty."""
+    return json.dumps(models) if models else None
 
 
 @dataclass
@@ -40,7 +65,8 @@ class LiveState:
     ewma_latency_ms: float | None = None
     last_ok_ts: float | None = None
     model: str | None = None
-    models: list[str] = field(default_factory=list)
+    models: list[str] = field(default_factory=list)      # after the allowlist
+    discovered: list[str] = field(default_factory=list)  # raw from the probe
 
 
 def _infer_kind(url: str, tunnel_id: str | None,
@@ -108,6 +134,50 @@ class Router:
                     f"alias {alias!r} already used by endpoint {row['name']!r}")
         return alias
 
+    def _validate_models(self, models: list[str] | None,
+                         exclude_id: str | None = None) -> list[str]:
+        """Normalize + validate an ``available_models`` allowlist.
+
+        Entries share the routing namespace with aliases — a client sends one
+        as ``"model"`` — so they must not collide with a reserved name, with
+        another endpoint's alias, or with another endpoint's allowlist.
+        Raises ValueError.
+        """
+        if not models:
+            return []
+        seen: dict[str, str] = {}
+        for raw in models:
+            model = str(raw).strip()
+            if not model:
+                continue
+            if not _MODEL_ID_RE.match(model):
+                raise ValueError(
+                    f"model id {model!r} has characters that can't appear in a"
+                    " routing name (letters/digits and . _ : / @ + -)")
+            if model.lower() in _RESERVED_ALIASES:
+                raise ValueError(f"model id {model!r} is reserved")
+            seen.setdefault(model.lower(), model)  # dedupe, keep first casing
+
+        for eid, row in self.endpoints.items():
+            if eid == exclude_id:
+                continue
+            alias = (row.get("alias") or "").lower()
+            if alias and alias in seen:
+                raise ValueError(
+                    f"model id {seen[alias]!r} is already the alias of"
+                    f" endpoint {row['name']!r}")
+            for other in parse_models(row.get("available_models")):
+                if other.lower() in seen:
+                    raise ValueError(
+                        f"model id {other!r} is already served by endpoint"
+                        f" {row['name']!r}")
+        return list(seen.values())
+
+    def available_models(self, eid: str) -> list[str]:
+        """The endpoint's declared model allowlist (empty when unset)."""
+        row = self.endpoints.get(eid)
+        return parse_models(row.get("available_models")) if row else []
+
     def resolve_alias(self, model: str | None) -> dict | None:
         """Endpoint whose alias matches the requested model name."""
         if not model:
@@ -117,6 +187,32 @@ class Router:
             if (row.get("alias") or "").lower() == wanted:
                 return row
         return None
+
+    def resolve_request_model(
+            self, model: str | None) -> tuple[dict | None, str | None]:
+        """Route an inbound ``model`` value to an endpoint.
+
+        Returns ``(endpoint, exact_model)``. Two ways to match, in order:
+
+        1. **Alias** — a routing name for the server itself. The model sent
+           upstream is the endpoint's choice (``upstream_model``), so
+           ``exact_model`` is None.
+        2. **Allowlist entry** — the caller named a real model the endpoint
+           declares it serves. That id is forwarded verbatim and outranks the
+           endpoint's ``model_override``; picking a specific model is the
+           whole point of asking for it by name.
+        """
+        if not model:
+            return None, None
+        alias_row = self.resolve_alias(model)
+        if alias_row is not None:
+            return alias_row, None
+        wanted = model.strip().lower()
+        for row in self.endpoints.values():
+            for candidate in parse_models(row.get("available_models")):
+                if candidate.lower() == wanted:
+                    return row, candidate
+        return None, None
 
     def upstream_model(self, eid: str) -> str | None:
         """Model to send upstream for alias-routed requests: explicit
@@ -158,6 +254,9 @@ class Router:
             "kind": spec.kind or _infer_kind(
                 spec.base_url, spec.tunnel_id, tunnel_command),
             "server_type": spec.server_type,
+            "protocol": spec.protocol,
+            "available_models": _models_json(
+                self._validate_models(spec.available_models)),
             "base_url": spec.base_url.rstrip("/"),
             "upstream_key": spec.upstream_key,
             "tunnel_id": spec.tunnel_id,
@@ -168,16 +267,21 @@ class Router:
             "model_override": spec.model_override,
             "created_ts": time.time(),
         }
+        # Positional insert against an explicit column list: the order here
+        # must stay in lockstep with the key order of `row` above.
         self.db.execute(
             "INSERT INTO endpoints (id, name, alias, kind, server_type,"
+            " protocol, available_models,"
             " base_url, upstream_key, tunnel_id, tunnel_command,"
             " tunnel_local_port, priority, weight, enabled,"
             " model_override, created_ts)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             tuple(row.values()))
         self.endpoints[eid] = row
         self.state[eid] = LiveState()
-        if self.pinned_id is None:
+        # Only an OpenAI-protocol endpoint can become the default pin; an
+        # alias-only protocol is never the fallback for `model: "auto"`.
+        if self.pinned_id is None and row["protocol"] == "openai":
             self.pinned_id = eid
             self._persist_router()
         log.info("endpoint created", extra={"data": {
@@ -200,6 +304,12 @@ class Router:
         if "tunnel_command" in changes:
             changes["tunnel_command"] = (
                 (changes["tunnel_command"] or "").strip() or None)
+        if "available_models" in changes:
+            # Row values go straight into the UPDATE below, so the column's
+            # storage form (JSON text) is what lands in the in-memory row.
+            changes["available_models"] = _models_json(
+                self._validate_models(changes["available_models"],
+                                      exclude_id=eid))
         row.update(changes)
         row["kind"] = patch.kind or _infer_kind(
             row["base_url"], row.get("tunnel_id"), row.get("tunnel_command"))
@@ -209,6 +319,8 @@ class Router:
             [v for k, v in row.items() if k != "id"] + [eid])
         if "base_url" in changes:
             self.state[eid] = LiveState()  # URL changed: health unknown again
+        elif "available_models" in changes:
+            self._apply_allowlist(eid)  # take effect now, not next probe
         log.info("endpoint updated", extra={"data": {"id": eid, **changes}})
         return row
 
@@ -354,9 +466,14 @@ class Router:
 
     # ---- resolution -----------------------------------------------------------
     def _eligible(self, exclude: set[str]) -> list[dict]:
+        # Non-OpenAI protocols are alias-only: an agent server is not a
+        # drop-in substitute for a raw llama.cpp box, so it must never be
+        # picked for `model: "auto"` or as a silent failover target. Reaching
+        # one is always something the caller asked for by name.
         rows = [
             r for r in self.endpoints.values()
             if r["enabled"] and r["id"] not in exclude
+            and (r.get("protocol") or "openai") == "openai"
             and self.state[r["id"]].health != "failed"
         ]
         rows.sort(key=lambda r: (-r["priority"], r["created_ts"] or 0))
@@ -368,6 +485,10 @@ class Router:
         exclude = exclude or set()
         if self.policy == "manual" and self.pinned_id:
             pinned = self.endpoints.get(self.pinned_id)
+            # Same alias-only rule as _eligible: pinning an agent server must
+            # not silently redirect every `model: "auto"` request into it.
+            if pinned and (pinned.get("protocol") or "openai") != "openai":
+                pinned = None
             if pinned and pinned["enabled"] and self.pinned_id not in exclude:
                 if self.state[self.pinned_id].health != "failed":
                     return pinned
@@ -424,10 +545,31 @@ class Router:
             "source": source}})
 
     def set_models(self, eid: str, models: list[str]) -> None:
+        """Record what a probe discovered, then narrow it to the allowlist.
+
+        The raw list is kept so the allowlist can be re-applied when it is
+        edited, without waiting for the next probe.
+        """
         st = self.state.get(eid)
-        if st is not None:
-            st.models = models
-            st.model = models[0] if models else None
+        if st is None:
+            return
+        st.discovered = models
+        self._apply_allowlist(eid)
+
+    def _apply_allowlist(self, eid: str) -> None:
+        st = self.state[eid]
+        allowed = self.available_models(eid)
+        if not allowed:
+            st.models = list(st.discovered)
+        else:
+            # Intersection in allowlist order — the operator's ordering is the
+            # one that decides the default model. An allowlisted id the probe
+            # didn't report is still honored: OpenCode's provider catalog can
+            # legitimately lag what a provider will actually serve.
+            discovered = {m.lower() for m in st.discovered}
+            matched = [m for m in allowed if m.lower() in discovered]
+            st.models = matched or allowed
+        st.model = st.models[0] if st.models else None
 
     # ---- views -----------------------------------------------------------------
     def out(self, eid: str, share: float = 0.0) -> EndpointOut:
@@ -436,7 +578,10 @@ class Router:
         return EndpointOut(
             id=row["id"], name=row["name"], alias=row.get("alias"),
             kind=row["kind"],
-            server_type=row["server_type"], base_url=row["base_url"],
+            server_type=row["server_type"],
+            protocol=row.get("protocol") or "openai",
+            available_models=self.available_models(eid),
+            base_url=row["base_url"],
             has_key=bool(row["upstream_key"]), tunnel_id=row["tunnel_id"],
             tunnel_command=row.get("tunnel_command"),
             tunnel_local_port=row.get("tunnel_local_port"),

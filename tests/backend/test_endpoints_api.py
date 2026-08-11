@@ -113,3 +113,48 @@ def test_admin_token_enforced(cfg):
         assert c.get("/admin/settings").status_code == 401
         ok = c.get("/admin/settings", headers={"X-Admin-Token": "sekrit"})
         assert ok.status_code == 200
+
+
+def test_protocol_and_available_models_round_trip(client):
+    r = client.post("/admin/endpoints", json={
+        "name": "agent", "base_url": "http://127.0.0.1:4096",
+        "protocol": "opencode", "server_type": "opencode", "alias": "agent",
+        "available_models": ["anthropic/claude-sonnet-4-5", "openai/gpt-5"]})
+    assert r.status_code == 201, r.text
+    ep = r.json()
+    assert ep["protocol"] == "opencode"
+    assert ep["available_models"] == ["anthropic/claude-sonnet-4-5",
+                                      "openai/gpt-5"]
+
+    r = client.patch(f"/admin/endpoints/{ep['id']}",
+                     json={"available_models": ["openai/gpt-5"]})
+    assert r.status_code == 200
+    assert r.json()["available_models"] == ["openai/gpt-5"]
+
+    assert client.get("/admin/endpoints").json()[0]["protocol"] == "opencode"
+
+
+def test_endpoint_defaults_to_the_openai_protocol(client):
+    r = client.post("/admin/endpoints", json={
+        "name": "plain", "base_url": "http://127.0.0.1:7070/v1"})
+    assert r.status_code == 201
+    assert r.json()["protocol"] == "openai"
+    assert r.json()["available_models"] == []
+
+
+def test_colliding_available_model_is_a_422(client):
+    client.post("/admin/endpoints", json={
+        "name": "a", "base_url": "http://127.0.0.1:7070/v1",
+        "available_models": ["openai/gpt-5"]})
+    r = client.post("/admin/endpoints", json={
+        "name": "b", "base_url": "http://127.0.0.1:9090/v1",
+        "available_models": ["openai/gpt-5"]})
+    assert r.status_code == 422
+    assert "already served" in r.json()["detail"]
+
+
+def test_unknown_protocol_is_rejected(client):
+    r = client.post("/admin/endpoints", json={
+        "name": "x", "base_url": "http://127.0.0.1:7070/v1",
+        "protocol": "telepathy"})
+    assert r.status_code == 422

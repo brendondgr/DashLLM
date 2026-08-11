@@ -1,8 +1,10 @@
 """A fake OpenAI-compatible upstream + a routing httpx transport.
 
 Hosts:
-- ``good``  -> in-process FastAPI app (models, chat/completions incl. SSE)
-- ``flaky`` -> always HTTP 500
+- ``good``     -> in-process FastAPI app (models, chat/completions incl. SSE)
+- ``strict``   -> serves one model, 404s any other (stale-override healing)
+- ``opencode`` -> fake ``opencode serve`` (sessions, parts, Basic auth)
+- ``flaky``    -> always HTTP 500
 - anything else -> httpx.ConnectError (a dead box)
 """
 
@@ -94,6 +96,87 @@ def make_strict_upstream() -> FastAPI:
     return up
 
 
+def make_opencode_upstream() -> tuple[FastAPI, dict]:
+    """A fake ``opencode serve``: Basic auth, provider catalog, and the
+    session -> message -> delete lifecycle the adapter drives.
+
+    Shapes mirror what the real server returns (``{info, parts}`` with usage on
+    ``info.tokens`` and a pre-priced ``info.cost``), so the adapter's
+    translation is exercised, not a convenient stand-in for it.
+    """
+    up = FastAPI()
+    calls = {
+        "auth": None, "health": 0, "providers": 0, "created": 0,
+        "deleted": 0, "aborted": 0, "messages": 0, "last_message": None,
+        "open_sessions": set(), "hang": False,
+    }
+
+    @up.get("/global/health")
+    async def health(request: Request):
+        calls["health"] += 1
+        calls["auth"] = request.headers.get("authorization")
+        return {"healthy": True, "version": "1.14.42"}
+
+    @up.get("/config/providers")
+    async def providers(request: Request):
+        calls["providers"] += 1
+        calls["auth"] = request.headers.get("authorization")
+        return {
+            "providers": [{
+                "id": "anthropic", "name": "Anthropic",
+                "models": {"claude-sonnet-4-5": {}, "claude-haiku-4-5": {}},
+            }, {
+                "id": "openai", "name": "OpenAI", "models": {"gpt-5": {}},
+            }],
+            "default": {"anthropic": "claude-sonnet-4-5"},
+        }
+
+    @up.post("/session")
+    async def create_session(request: Request):
+        calls["created"] += 1
+        calls["auth"] = request.headers.get("authorization")
+        sid = f"ses_{calls['created']}"
+        calls["open_sessions"].add(sid)
+        return {"id": sid, "title": (await request.json()).get("title")}
+
+    @up.post("/session/{sid}/message")
+    async def message(sid: str, request: Request):
+        calls["messages"] += 1
+        body = await request.json()
+        calls["last_message"] = {"session": sid, **body}
+        if calls["hang"]:
+            await asyncio.sleep(30)
+        model = body.get("model") or {}
+        return {
+            "info": {
+                "id": "msg_1", "role": "assistant", "sessionID": sid,
+                "providerID": model.get("providerID", "anthropic"),
+                "modelID": model.get("modelID", "claude-sonnet-4-5"),
+                "cost": 0.00123,
+                "tokens": {"input": 11, "output": 4, "reasoning": 2,
+                           "cache": {"read": 0, "write": 0}},
+            },
+            "parts": [
+                {"type": "text", "text": "agent says hi"},
+                {"type": "tool", "tool": "bash", "state": {"status": "done"}},
+                {"type": "text", "text": " and done"},
+            ],
+        }
+
+    @up.post("/session/{sid}/abort")
+    async def abort(sid: str):
+        calls["aborted"] += 1
+        return {"ok": True}
+
+    @up.delete("/session/{sid}")
+    async def delete_session(sid: str):
+        calls["deleted"] += 1
+        calls["open_sessions"].discard(sid)
+        return {"ok": True}
+
+    return up, calls
+
+
 class _AlwaysFailTransport(httpx.AsyncBaseTransport):
     async def handle_async_request(self, request):
         return httpx.Response(500, content=b"upstream exploded",
@@ -101,12 +184,15 @@ class _AlwaysFailTransport(httpx.AsyncBaseTransport):
 
 
 class RoutingTransport(httpx.AsyncBaseTransport):
-    def __init__(self, upstream_app: FastAPI):
+    def __init__(self, upstream_app: FastAPI,
+                 opencode_app: FastAPI | None = None):
         self._routes: dict[str, httpx.AsyncBaseTransport] = {
             "good": httpx.ASGITransport(app=upstream_app),
             "flaky": _AlwaysFailTransport(),
             "strict": httpx.ASGITransport(app=make_strict_upstream()),
         }
+        if opencode_app is not None:
+            self._routes["opencode"] = httpx.ASGITransport(app=opencode_app)
 
     async def handle_async_request(self, request):
         transport = self._routes.get(request.url.host)

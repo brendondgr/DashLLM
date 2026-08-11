@@ -56,3 +56,28 @@ def proxy_env(cfg):
         app.state.proxy.http = fake
         app.state.prober.http = fake
         yield c, app, calls
+
+
+@pytest.fixture
+def opencode_env(cfg):
+    """App wired to a fake ``opencode serve`` on host ``opencode``, alongside
+    the usual good/flaky/strict hosts.
+
+    Yields (client, app, opencode_calls).
+    """
+    import httpx
+
+    from fake_upstream import (
+        RoutingTransport, make_opencode_upstream, make_upstream,
+    )
+
+    upstream, _ = make_upstream()
+    oc_app, oc_calls = make_opencode_upstream()
+    app = create_app(cfg)
+    with TestClient(app) as c:
+        fake = httpx.AsyncClient(
+            transport=RoutingTransport(upstream, oc_app), timeout=5.0)
+        app.state.http = fake
+        app.state.proxy.http = fake
+        app.state.prober.http = fake
+        yield c, app, oc_calls

@@ -1,26 +1,23 @@
-"""Active health probing: GET {base_url}/models on an interval.
+"""Active health probing on an interval.
 
-Feeds the router's health state machine and discovers served model names.
+*What* a probe is depends on the endpoint's protocol — ``GET /models`` for an
+OpenAI-compatible server, ``/global/health`` + ``/config/providers`` for
+OpenCode — so the request itself lives in the adapter. This module owns the
+cadence, the state-machine feed, and model discovery, all protocol-agnostic.
+
 Also powers the dashboard's on-demand "Test connection" button.
 """
 
 import asyncio
-import time
 
 import httpx
 
 from app.core.logging import get_logger
 from app.schemas import EndpointTestResult
+from app.services.adapters import get_adapter
 from app.services.router import Router
 
 log = get_logger("health")
-
-
-def _model_ids(payload) -> list[str]:
-    try:
-        return [m.get("id", "?") for m in payload.get("data", [])]
-    except AttributeError:
-        return []
 
 
 class HealthProber:
@@ -78,26 +75,4 @@ class HealthProber:
         row = self.router.endpoints.get(eid)
         if row is None:
             return None
-        url = row["base_url"] + "/models"
-        headers = {}
-        if row["upstream_key"]:
-            headers["Authorization"] = f"Bearer {row['upstream_key']}"
-        t0 = time.perf_counter()
-        try:
-            resp = await self.http.get(url, headers=headers, timeout=self.timeout)
-            latency = (time.perf_counter() - t0) * 1000
-            if resp.status_code == 200:
-                models = _model_ids(resp.json())
-                log.debug("probe ok", extra={"data": {
-                    "endpoint": row["name"], "latency_ms": round(latency, 1),
-                    "models": len(models)}})
-                return EndpointTestResult(
-                    ok=True, latency_ms=round(latency, 1), models=models)
-            return EndpointTestResult(
-                ok=False, latency_ms=round(latency, 1),
-                error=f"HTTP {resp.status_code}")
-        except httpx.HTTPError as e:
-            latency = (time.perf_counter() - t0) * 1000
-            return EndpointTestResult(
-                ok=False, latency_ms=round(latency, 1),
-                error=f"{type(e).__name__}: {e}")
+        return await get_adapter(row).probe(self.http, row, self.timeout)

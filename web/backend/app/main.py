@@ -80,6 +80,16 @@ async def lifespan(app: FastAPI):
     log.info("relay started", extra={"data": {
         "version": __version__, "port": app.state.cfg.port,
         "db": str(app.state.cfg.db_path)}})
+    # An agent endpoint runs shell commands and edits files on its host by
+    # design, so an unauthenticated relay in front of one is an open remote
+    # shell. Loud, once, at boot — quietly proxying it would be worse.
+    agents = [r["name"] for r in app.state.router.endpoints.values()
+              if (r.get("protocol") or "openai") != "openai"]
+    if agents and not cfg.require_client_key:
+        log.warning(
+            "agent endpoints are reachable without a client key; set"
+            " RELAY_REQUIRE_CLIENT_KEY=1",
+            extra={"data": {"endpoints": agents}})
     try:
         yield
     finally:
