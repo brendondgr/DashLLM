@@ -1,0 +1,31 @@
+[Unit]
+Description=OpenCode agent server (relay upstream)
+# PartOf makes systemd propagate relay's stop/restart down to this unit, and
+# relay.service's Wants= pulls it up on start. Together that means `relay
+# start|stop|restart` — and plain `systemctl --user ... relay.service` —
+# control both servers, without the wrapper script having to remember to.
+PartOf=relay.service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Config (port, project directory, credentials, provider keys) is read from
+# .env by the wrapper — systemd cannot expand variables in WorkingDirectory=
+# and `opencode` is not on its default PATH.
+ExecStart=%h/Tools/DashLLM/scripts/opencode-serve.sh
+# on-failure, not always: the wrapper exits 0 when OPENCODE_ENABLED=0, and
+# Restart=always would treat that deliberate no-op as a crash and respawn it
+# every 5s forever. A genuine crash is still restarted.
+Restart=on-failure
+RestartSec=5
+# The wrapper exits 78 (EX_CONFIG) when .env has no password and 127 when the
+# opencode binary is missing. Neither is fixed by trying again.
+RestartPreventExitStatus=78 127
+Environment=PYTHONUNBUFFERED=1
+# An agent turn can legitimately run for minutes; don't kill one mid-tool-call
+# on shutdown any faster than necessary.
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

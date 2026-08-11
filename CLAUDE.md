@@ -104,6 +104,17 @@ backend changes and `npm run build` + `relay restart` picks up frontend ones.
   them, and there are tests asserting each.
 - **`Router.create` inserts positionally.** Its `row` dict key order must
   match the explicit column list in the INSERT right below it.
+- **Nothing runtime-configurable belongs in a systemd unit file.** Both units
+  `ExecStart` a wrapper (`scripts/{relay,opencode}-serve.sh`) that sources
+  `.env`, because systemd can't expand variables in `WorkingDirectory=` and
+  because a value baked into the unit is silently reverted the next time
+  `install-systemd.sh` runs — which is exactly how a local `--host 0.0.0.0`
+  edit got lost once.
+- **`uv` exits 143 on SIGTERM**, so `relay.service` needs
+  `SuccessExitStatus=143` or a clean stop parks the unit in `failed`.
+- **Never write to the repo's `.env`.** It is the user's real configuration and
+  is gitignored, so an overwrite is unrecoverable. `launch.sh --env-file` and
+  a scratch path exist for testing.
 
 ## Testing
 

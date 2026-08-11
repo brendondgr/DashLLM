@@ -83,7 +83,7 @@ root/
 ├── tests/backend/           # pytest suite (136 tests)
 ├── utils/                   # seed_telemetry.py
 ├── scripts/                 # dev.sh, relay, install-systemd.sh, validate_live.sh
-└── deploy/systemd/          # relay.service (systemd user unit)
+└── deploy/systemd/          # relay.service + opencode.service (user units)
 ```
 
 ## Tests

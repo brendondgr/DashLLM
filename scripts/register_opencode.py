@@ -138,8 +138,17 @@ def main() -> int:
         return 1
 
     served = body.get("available_models") or []
-    print(f"  {verb} endpoint {name!r} · alias {alias!r} · health "
-          f"{body.get('health', '?')}")
+    # POST /endpoints probes on create, PATCH does not — so on an update the
+    # health in the response is whatever the state machine last knew, which
+    # right after a restart is "unknown". Probe explicitly so the line printed
+    # after `relay start` reflects the server that is actually there.
+    health = body.get("health", "?")
+    probe_status, probe = api("POST", f"/admin/endpoints/{body['id']}/test")
+    if probe_status == 200 and isinstance(probe, dict):
+        health = "healthy" if probe.get("ok") else (
+            f"unreachable ({probe.get('error', 'no detail')})")
+
+    print(f"  {verb} endpoint {name!r} · alias {alias!r} · health {health}")
     print(f"  models: {', '.join(served) if served else '(alias only)'}")
     return 0
 

@@ -7,22 +7,31 @@ Description=DashLLM relay - OpenAI-compatible LLM proxy + dashboard
 # quickly; relay tolerates a down endpoint via health probes + failover.
 After=network-online.target llamacpp-router.service
 Wants=network-online.target
+# Bring the OpenCode agent server up with relay, and (via its PartOf=) take it
+# down with relay. Wants= not Requires=: a missing or misconfigured agent
+# server must not stop the proxy from serving every other endpoint.
+Wants=opencode.service
+Before=opencode.service
 
 [Service]
 Type=simple
 WorkingDirectory=%h/Tools/DashLLM/web/backend
-# uv resolves the project venv from the pyproject.toml in WorkingDirectory.
-ExecStart=/usr/bin/uv run uvicorn app.main:app --host 127.0.0.1 --port 4000
+# The wrapper sources .env and takes RELAY_HOST / RELAY_PORT from it, so the
+# bind address is configuration rather than a value baked into this file that
+# a re-install would silently revert. uv resolves the project venv from the
+# pyproject.toml in WorkingDirectory.
+ExecStart=%h/Tools/DashLLM/scripts/relay-serve.sh
 Restart=always
 RestartSec=5
+# `uv` traps SIGTERM and exits 143 (128+15) rather than dying from the signal,
+# so without this a clean `relay stop` parks the unit in `failed` — alarming in
+# status output and a false alarm for anything watching unit state.
+SuccessExitStatus=143
 Environment=PYTHONUNBUFFERED=1
 # Persist runtime state (registered endpoints, telemetry) under the repo.
+# .env wins over these if it sets them.
 Environment=RELAY_DB_PATH=%h/Tools/DashLLM/web/backend/data/relay.db
 Environment=RELAY_LOG_DIR=%h/Tools/DashLLM/web/backend/logs
-# Same .env launch.sh reads, so the service and the script agree on
-# RELAY_REQUIRE_CLIENT_KEY / RELAY_ADMIN_TOKEN. Leading `-` = optional.
-# Note: ExecStart's --port above is fixed; RELAY_PORT in .env does not move it.
-EnvironmentFile=-%h/Tools/DashLLM/.env
 
 [Install]
 WantedBy=default.target

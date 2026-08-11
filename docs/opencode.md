@@ -59,11 +59,42 @@ after an edit converges rather than duplicating. Ctrl-C stops both. To fill in
 ```
 
 If relay is already running as a systemd service on the same port, `launch.sh`
-says so; `./launch.sh --takeover` stops the service first. The service reads
-the same `.env` (via `EnvironmentFile`), so `relay start` and `./launch.sh`
-agree on `RELAY_REQUIRE_CLIENT_KEY` and `RELAY_ADMIN_TOKEN` — but the unit's
-`ExecStart` pins its own `--port`, so `RELAY_PORT` only moves the port for
-`launch.sh`. Re-run `./scripts/install-systemd.sh` after pulling this change.
+says so; `./launch.sh --takeover` stops the service first.
+
+### Or as services: `relay start | stop | restart`
+
+`./scripts/install-systemd.sh` installs two systemd *user* units —
+`relay.service` and `opencode.service` — both reading the same `.env`:
+
+```bash
+./scripts/install-systemd.sh
+```
+
+`opencode.service` is `PartOf=relay.service` and pulled in by its `Wants=`, so
+one command drives both:
+
+| Command | Effect |
+| --- | --- |
+| `relay start` | starts relay + opencode, then registers the endpoint from `.env` |
+| `relay stop` | stops both |
+| `relay restart` | restarts both and re-registers |
+| `relay status` | unit state for both, relay health, and each endpoint's health |
+| `relay logs` | follows both journals |
+| `relay enable` / `disable` | on-boot behavior for both |
+
+Add `--relay-only` to any of them to leave the agent server alone.
+
+`OPENCODE_ENABLED=0` in `.env` takes opencode out entirely: `relay` skips the
+unit, and the unit itself exits without starting if something else launches it.
+The wrapper also refuses to start (exit 78, no restart loop) when
+`OPENCODE_SERVER_PASSWORD` is empty, rather than serving an unauthenticated
+agent.
+
+Both units take `RELAY_HOST`, `RELAY_PORT`, `OPENCODE_PORT`, and
+`OPENCODE_PROJECT_DIR` from `.env` — nothing is baked into the unit files, so a
+re-install cannot revert a local change. Re-run
+`./scripts/install-systemd.sh` after pulling this change; it also refreshes
+`~/.local/bin/relay` if you installed it there.
 
 ### Three different keys
 

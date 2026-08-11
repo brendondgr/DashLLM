@@ -33,7 +33,7 @@ Settings screen. An `.env` file in `web/backend/` is also read.
 
 | Var | Default | Purpose |
 | --- | --- | --- |
-| `RELAY_HOST` | `127.0.0.1` | bind host |
+| `RELAY_HOST` | `127.0.0.1` | bind host; read from `.env` by the systemd wrapper too |
 | `RELAY_PORT` | `4000` | proxy/dashboard port (also persisted via Settings) |
 | `RELAY_DB_PATH` | `web/backend/data/relay.db` | SQLite database |
 | `RELAY_LOG_DIR` | `web/backend/logs` | rotating JSON-lines logs |
