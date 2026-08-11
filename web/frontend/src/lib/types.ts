@@ -7,7 +7,13 @@ export interface EndpointOut {
   alias: string | null;
   model_override: string | null;
   kind: 'local' | 'remote_direct' | 'remote_tunnel';
-  server_type: 'llama.cpp' | 'vLLM' | 'ollama' | 'openai';
+  server_type: 'llama.cpp' | 'vLLM' | 'ollama' | 'openai' | 'opencode';
+  /** Wire protocol relay speaks to this upstream. Non-'openai' endpoints are
+   * alias-only: never chosen for "auto" or as a failover target. */
+  protocol: 'openai' | 'opencode';
+  /** Explicit model ids this endpoint serves. Each one is advertised in
+   * GET /v1/models and routes here with that exact model. */
+  available_models: string[];
   base_url: string;
   has_key: boolean;
   tunnel_id: string | null;

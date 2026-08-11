@@ -5,6 +5,10 @@ import { C, ACCENT, MONO, SANS, dot, badge, statusColor } from '../../lib/styles
 import { api } from '../../lib/api';
 import { log } from '../../lib/logger';
 import { usePoll } from '../../hooks/usePoll';
+import EndpointForm, {
+  emptyForm, formFromEndpoint, inputStyle, parseModels, protocolFor, selectStyle,
+} from './EndpointForm';
+import type { EndpointFormValues } from './EndpointForm';
 
 interface EndpointsProps {
   endpoints: EndpointOut[];
@@ -20,38 +24,12 @@ interface TestEntry {
   result: EndpointTestResult | null;
 }
 
-const inputStyle: CSSProperties = {
-  background: C.bgSidebar,
-  border: `1px solid ${C.borderStrong}`,
-  borderRadius: 6,
-  color: C.text,
-  padding: '7px 10px',
-  font: `400 12px ${MONO}`,
-  outline: 'none',
-  // border-box + full width so inputs stay inside their grid columns.
-  boxSizing: 'border-box',
-  width: '100%',
-  minWidth: 0,
-};
-
-const selectStyle: CSSProperties = {
-  background: C.bgSidebar,
-  border: `1px solid ${C.borderStrong}`,
-  borderRadius: 6,
-  color: C.text,
-  padding: '7px 8px',
-  font: `400 12px ${MONO}`,
-  outline: 'none',
-  boxSizing: 'border-box',
-  width: '100%',
-  minWidth: 0,
-};
-
 export default function Endpoints(props: EndpointsProps): React.JSX.Element {
   const { endpoints, swapping, onActivate, refresh } = props;
 
   const [addOpen, setAddOpen] = useState(false);
-  const [form, setForm] = useState({ name: '', type: 'llama.cpp', alias: '', url: '', key: '', tunnel: '' });
+  const [form, setForm] = useState<EndpointFormValues>(emptyForm);
+  const [tunnel, setTunnel] = useState('');
   const [tests, setTests] = useState<Record<string, TestEntry>>({});
 
   // ~/.ssh/config hosts, so a shorthand tunnel command can be built from a real
@@ -60,9 +38,9 @@ export default function Endpoints(props: EndpointsProps): React.JSX.Element {
   const [tunnelHint, setTunnelHint] = useState<string | null>(null);
   useEffect(() => { api.sshHosts().then(setSshHosts).catch(() => { /* no config */ }); }, []);
 
-  // Editing an existing endpoint's name/type/alias/url/key inline.
+  // Editing an existing endpoint inline (same form component as Add).
   const [editId, setEditId] = useState<string | null>(null);
-  const [editForm, setEditForm] = useState({ name: '', type: 'llama.cpp', alias: '', url: '', key: '' });
+  const [editForm, setEditForm] = useState<EndpointFormValues>(emptyForm);
 
   // Saved ssh routes (multiple candidate tunnel commands) per endpoint,
   // fetched lazily when a card's "SSH routes" panel is opened.
@@ -86,9 +64,8 @@ export default function Endpoints(props: EndpointsProps): React.JSX.Element {
 
   const toggleAdd = useCallback(() => setAddOpen(o => !o), []);
 
-  const handleFormChange = (field: string) =>
-    (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>) =>
-      setForm(f => ({ ...f, [field]: e.target.value }));
+  const patchForm = useCallback(
+    (patch: Partial<EndpointFormValues>) => setForm(f => ({ ...f, ...patch })), []);
 
   const saveEp = useCallback(async () => {
     if (!form.name || !form.url) return;
@@ -97,18 +74,21 @@ export default function Endpoints(props: EndpointsProps): React.JSX.Element {
         name: form.name,
         base_url: form.url,
         server_type: form.type,
+        protocol: protocolFor(form.type),
+        available_models: parseModels(form.models),
         upstream_key: form.key || null,
         alias: form.alias.trim() || null,
-        tunnel_command: form.tunnel.trim() || null,
+        tunnel_command: tunnel.trim() || null,
       });
-      log.info('endpoints.create', `${form.name}${form.alias ? ` (alias ${form.alias})` : ''}${form.tunnel.trim() ? ' +tunnel' : ''}`);
+      log.info('endpoints.create', `${form.name}${form.alias ? ` (alias ${form.alias})` : ''}${tunnel.trim() ? ' +tunnel' : ''}`);
       setAddOpen(false);
-      setForm({ name: '', type: 'llama.cpp', alias: '', url: '', key: '', tunnel: '' });
+      setForm(emptyForm());
+      setTunnel('');
       refresh();
     } catch {
       // api already logs errors
     }
-  }, [form, refresh]);
+  }, [form, tunnel, refresh]);
 
   // Build a shorthand `ssh -N -L ...` from a ~/.ssh/config alias, and surface
   // the real IdentityFile ssh resolves for it (or warn if none is configured).
@@ -117,7 +97,7 @@ export default function Endpoints(props: EndpointsProps): React.JSX.Element {
     if (!h) { setTunnelHint(null); return; }
     let port = 8000;
     try { const u = new URL(form.url); if (u.port) port = +u.port; } catch { /* ignore */ }
-    setForm(f => ({ ...f, tunnel: `ssh -N -L 127.0.0.1:${port}:localhost:${port} ${alias}` }));
+    setTunnel(`ssh -N -L 127.0.0.1:${port}:localhost:${port} ${alias}`);
     const via = h.proxyjump ? ` · via ${h.proxyjump}` : '';
     setTunnelHint(
       h.identity_explicit && h.identity_file
@@ -160,7 +140,7 @@ export default function Endpoints(props: EndpointsProps): React.JSX.Element {
     }
   }, [termInput]);
 
-  const testEndpoint = useCallback(async (id: string, baseUrl: string) => {
+  const testEndpoint = useCallback(async (id: string) => {
     setTests(t => ({ ...t, [id]: { state: 'testing', result: null } }));
     log.info('endpoints.test', id);
     try {
@@ -175,10 +155,13 @@ export default function Endpoints(props: EndpointsProps): React.JSX.Element {
 
   const startEdit = useCallback((e: EndpointOut) => {
     setEditId(e.id);
-    setEditForm({ name: e.name, type: e.server_type, alias: e.alias ?? '', url: e.base_url, key: '' });
+    setEditForm(formFromEndpoint(e));
   }, []);
 
   const cancelEdit = useCallback(() => setEditId(null), []);
+
+  const patchEditForm = useCallback(
+    (patch: Partial<EndpointFormValues>) => setEditForm(f => ({ ...f, ...patch })), []);
 
   const saveEdit = useCallback(async () => {
     if (!editId || !editForm.name || !editForm.url) return;
@@ -186,6 +169,8 @@ export default function Endpoints(props: EndpointsProps): React.JSX.Element {
       name: editForm.name,
       base_url: editForm.url,
       server_type: editForm.type,
+      protocol: protocolFor(editForm.type),
+      available_models: parseModels(editForm.models),
       alias: editForm.alias.trim() || null,
     };
     if (editForm.key.trim()) patch.upstream_key = editForm.key.trim();
@@ -323,106 +308,50 @@ export default function Endpoints(props: EndpointsProps): React.JSX.Element {
           <span style={{ font: `600 11px ${SANS}`, letterSpacing: '.07em', textTransform: 'uppercase', color: C.textMut }}>
             New endpoint
           </span>
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 130px 110px 1fr 1fr', gap: 10 }}>
+          <EndpointForm
+            values={form}
+            onChange={patchForm}
+            onSave={saveEp}
+            onCancel={toggleAdd}
+            saveLabel="Save endpoint"
+          >
             <input
-              placeholder="name"
-              value={form.name}
-              onChange={handleFormChange('name')}
+              placeholder='ssh tunnel command (optional) — e.g. ssh -N -L 127.0.0.1:9090:localhost:9090 skynet-alt'
+              value={tunnel}
+              onChange={(e) => { setTunnel(e.target.value); setTunnelHint(null); }}
               style={inputStyle}
             />
-            <select
-              value={form.type}
-              onChange={handleFormChange('type')}
-              style={selectStyle}
-            >
-              <option value="llama.cpp">llama.cpp</option>
-              <option value="vLLM">vLLM</option>
-              <option value="ollama">ollama</option>
-              <option value="openai">OpenAI-compat</option>
-            </select>
-            <input
-              placeholder="alias (skynet)"
-              value={form.alias}
-              onChange={handleFormChange('alias')}
-              style={inputStyle}
-            />
-            <input
-              placeholder="http://127.0.0.1:8000/v1"
-              value={form.url}
-              onChange={handleFormChange('url')}
-              style={inputStyle}
-            />
-            <input
-              placeholder="api key (optional)"
-              value={form.key}
-              onChange={handleFormChange('key')}
-              style={inputStyle}
-            />
-          </div>
-          <input
-            placeholder='ssh tunnel command (optional) — e.g. ssh -N -L 127.0.0.1:9090:localhost:9090 skynet-alt'
-            value={form.tunnel}
-            onChange={(e) => { handleFormChange('tunnel')(e); setTunnelHint(null); }}
-            style={inputStyle}
-          />
-          {sshHosts.length > 0 && (
-            <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-              <span style={{ font: `400 10.5px ${SANS}`, color: C.textDim, whiteSpace: 'nowrap' }}>
-                or build from ~/.ssh/config:
-              </span>
-              <select
-                defaultValue=""
-                onChange={(e) => { if (e.target.value) pickTunnelHost(e.target.value); }}
-                style={{ ...selectStyle, width: 'auto', minWidth: 180, cursor: 'pointer' }}
-              >
-                <option value="">— pick a host —</option>
-                {sshHosts.map((h) => (
-                  <option key={h.alias} value={h.alias}>
-                    {h.alias}{h.hostname ? ` (${h.hostname})` : ''}{h.proxyjump ? ` ↝ ${h.proxyjump}` : ''}
-                  </option>
-                ))}
-              </select>
-              {tunnelHint && (
-                <span style={{ font: `400 10px ${MONO}`, color: C.textDim, wordBreak: 'break-all' }}>
-                  {tunnelHint}
+            {sshHosts.length > 0 && (
+              <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                <span style={{ font: `400 10.5px ${SANS}`, color: C.textDim, whiteSpace: 'nowrap' }}>
+                  or build from ~/.ssh/config:
                 </span>
-              )}
-            </div>
-          )}
-          <span style={{ font: `400 10.5px ${SANS}`, color: C.textDim }}>
-            alias = routing name: clients send it as the <span style={{ fontFamily: MONO }}>model</span> to reach this server directly
-            (e.g. <span style={{ fontFamily: MONO }}>"model": "skynet"</span>); relay rewrites it to the server's real model.
-            Add an <b style={{ color: C.textMut }}>ssh tunnel command</b> for a remote server you reach over SSH — you connect it manually
-            with <b style={{ color: C.textMut }}>Connect</b>, and any password/passphrase prompt appears here.
-          </span>
-          <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
-            <div
-              onClick={toggleAdd}
-              style={{
-                padding: '6px 14px',
-                borderRadius: 6,
-                border: `1px solid ${C.borderStrong}`,
-                color: C.textMut,
-                font: `500 12px ${SANS}`,
-                cursor: 'pointer',
-              }}
-            >
-              Cancel
-            </div>
-            <div
-              onClick={saveEp}
-              style={{
-                padding: '6px 14px',
-                borderRadius: 6,
-                background: '#3FB950',
-                color: '#0B0E14',
-                font: `600 12px ${SANS}`,
-                cursor: 'pointer',
-              }}
-            >
-              Save endpoint
-            </div>
-          </div>
+                <select
+                  defaultValue=""
+                  onChange={(e) => { if (e.target.value) pickTunnelHost(e.target.value); }}
+                  style={{ ...selectStyle, width: 'auto', minWidth: 180, cursor: 'pointer' }}
+                >
+                  <option value="">— pick a host —</option>
+                  {sshHosts.map((h) => (
+                    <option key={h.alias} value={h.alias}>
+                      {h.alias}{h.hostname ? ` (${h.hostname})` : ''}{h.proxyjump ? ` ↝ ${h.proxyjump}` : ''}
+                    </option>
+                  ))}
+                </select>
+                {tunnelHint && (
+                  <span style={{ font: `400 10px ${MONO}`, color: C.textDim, wordBreak: 'break-all' }}>
+                    {tunnelHint}
+                  </span>
+                )}
+              </div>
+            )}
+            <span style={{ font: `400 10.5px ${SANS}`, color: C.textDim }}>
+              alias = routing name: clients send it as the <span style={{ fontFamily: MONO }}>model</span> to reach this server directly
+              (e.g. <span style={{ fontFamily: MONO }}>"model": "skynet"</span>); relay rewrites it to the server's real model.
+              Add an <b style={{ color: C.textMut }}>ssh tunnel command</b> for a remote server you reach over SSH — you connect it manually
+              with <b style={{ color: C.textMut }}>Connect</b>, and any password/passphrase prompt appears here.
+            </span>
+          </EndpointForm>
         </div>
       )}
 
@@ -494,15 +423,18 @@ export default function Endpoints(props: EndpointsProps): React.JSX.Element {
           whiteSpace: 'nowrap',
         };
 
+        // What a probe actually calls depends on the protocol (see the
+        // adapters), so the message has to follow it.
+        const probePath = e.protocol === 'opencode' ? '/global/health' : '/models';
         const testMsg =
           ts === 'ok' && tr
-            ? `GET ${e.base_url}/models → 200 OK · ${tr.latency_ms}ms · ${tr.models[0] ?? ''}`
+            ? `GET ${e.base_url}${probePath} → 200 OK · ${tr.latency_ms}ms · ${tr.models[0] ?? ''}`
           : ts === 'fail' && tr?.error
-            ? `GET ${e.base_url}/models → ${tr.error}`
+            ? `GET ${e.base_url}${probePath} → ${tr.error}`
           : ts === 'fail'
-            ? `GET ${e.base_url}/models → connection refused (timeout 5s)`
+            ? `GET ${e.base_url}${probePath} → connection refused (timeout 5s)`
           : ts === 'testing'
-            ? 'Probing /v1/models…'
+            ? `Probing ${probePath}…`
           : '';
 
         const testMsgColor =
@@ -534,6 +466,11 @@ export default function Endpoints(props: EndpointsProps): React.JSX.Element {
                       model:{e.alias}
                     </span>
                   )}
+                  {e.protocol !== 'openai' && (
+                    <span style={badge(C.purple)} title="agent protocol — reachable only by name, never via &quot;auto&quot; or failover">
+                      alias-only
+                    </span>
+                  )}
                   {e.active && (
                     <span style={{
                       padding: '2px 8px',
@@ -552,13 +489,22 @@ export default function Endpoints(props: EndpointsProps): React.JSX.Element {
                 <span style={{ font: `400 11px ${MONO}`, color: C.textMut }}>
                   {e.base_url} <span style={{ color: C.textDim }}>·</span> {e.model ?? '—'}
                 </span>
+                {(e.available_models?.length ?? 0) > 0 && (
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5, marginTop: 2 }}>
+                    {e.available_models.map(m => (
+                      <span key={m} style={badge(C.cyan)} title="send this as &quot;model&quot; to reach this endpoint with this exact model">
+                        {m}
+                      </span>
+                    ))}
+                  </div>
+                )}
               </div>
               <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 1, marginRight: 6 }}>
                 <span style={{ font: `500 12px ${MONO}`, color: C.text }}>{latDisplay}</span>
                 <span style={{ font: `400 9.5px ${SANS}`, color: C.textDim }}>avg latency</span>
               </div>
               <div
-                onClick={() => testEndpoint(e.id, e.base_url)}
+                onClick={() => testEndpoint(e.id)}
                 style={testStyle}
               >
                 {testLabel}
@@ -732,33 +678,14 @@ export default function Endpoints(props: EndpointsProps): React.JSX.Element {
                 display: 'flex', flexDirection: 'column', gap: 10,
                 background: C.bg, border: `1px solid ${C.border}`, borderRadius: 6, padding: 12,
               }}>
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 130px 110px 1fr 1fr', gap: 10 }}>
-                  <input placeholder="name" value={editForm.name}
-                    onChange={(ev) => setEditForm(f => ({ ...f, name: ev.target.value }))} style={inputStyle} />
-                  <select value={editForm.type}
-                    onChange={(ev) => setEditForm(f => ({ ...f, type: ev.target.value }))} style={selectStyle}>
-                    <option value="llama.cpp">llama.cpp</option>
-                    <option value="vLLM">vLLM</option>
-                    <option value="ollama">ollama</option>
-                    <option value="openai">OpenAI-compat</option>
-                  </select>
-                  <input placeholder="alias (skynet)" value={editForm.alias}
-                    onChange={(ev) => setEditForm(f => ({ ...f, alias: ev.target.value }))} style={inputStyle} />
-                  <input placeholder="http://127.0.0.1:8000/v1" value={editForm.url}
-                    onChange={(ev) => setEditForm(f => ({ ...f, url: ev.target.value }))} style={inputStyle} />
-                  <input placeholder="api key (leave blank to keep)" value={editForm.key}
-                    onChange={(ev) => setEditForm(f => ({ ...f, key: ev.target.value }))} style={inputStyle} />
-                </div>
-                <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
-                  <div onClick={cancelEdit} style={{
-                    padding: '6px 14px', borderRadius: 6, border: `1px solid ${C.borderStrong}`,
-                    color: C.textMut, font: `500 12px ${SANS}`, cursor: 'pointer',
-                  }}>Cancel</div>
-                  <div onClick={saveEdit} style={{
-                    padding: '6px 14px', borderRadius: 6, background: '#3FB950',
-                    color: '#0B0E14', font: `600 12px ${SANS}`, cursor: 'pointer',
-                  }}>Save changes</div>
-                </div>
+                <EndpointForm
+                  values={editForm}
+                  onChange={patchEditForm}
+                  onSave={saveEdit}
+                  onCancel={cancelEdit}
+                  saveLabel="Save changes"
+                  keepKeyHint
+                />
               </div>
             )}
 

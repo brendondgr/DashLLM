@@ -93,6 +93,7 @@ Against live model servers:
 | [api-contract.md](docs/api-contract.md) | Object shapes, stats payloads, auth |
 | [routes.md](docs/routes.md) | Every HTTP route |
 | [data-flow.md](docs/data-flow.md) | Hot path, poll loops, control-plane writes, logging |
+| [opencode.md](docs/opencode.md) | Fronting an OpenCode agent server: setup, model allowlists, gotchas |
 | [frontend.md](docs/frontend.md) | Component map, design tokens, chart conventions |
 | [deployment.md](docs/deployment.md) | Single-process production, env vars, systemd, security posture |
 

@@ -87,8 +87,9 @@ failover may land on an endpoint running a different model.
 | Auth | `app/security.py` | `admin_guard` dependency, bearer extraction, key masking |
 | Storage | `app/db.py` | SQLite (WAL), additive column migrations, one-time rollup backfill |
 | Proxy | `app/services/proxy.py` + `app/routes/v1.py` | streaming tee, TTFT, usage capture, pre-first-byte retry, stale-override self-heal |
-| Router | `app/services/router.py` | registry, alias routing, health state machine, tunnel routes |
-| Health | `app/services/health.py` | active `GET {base_url}/models` prober; also powers "Test connection" |
+| Protocol adapters | `app/services/adapters/` | per-`protocol` probe + forward; `passthrough` (OpenAI) and `opencode` (agent sessions) |
+| Router | `app/services/router.py` | registry, alias + allowlist routing, health state machine, tunnel routes |
+| Health | `app/services/health.py` | probe cadence + state feed; the probe request itself comes from the adapter |
 | Stats | `app/services/stats.py` + `app/routes/admin_stats.py` | ECharts-shaped aggregates over rollups and raw rows |
 | Rollups | `app/services/rollup.py`, `app/services/histogram.py` | hourly pre-aggregation + log-spaced percentile histograms |
 | Telemetry | `app/services/telemetry.py` | asyncio queue, off-hot-path writes, `LiveTracker`, retention pruning |
@@ -125,6 +126,40 @@ Transparent retry on another endpoint is safe **only before the first byte**
 reaches the client, so it only happens on connect errors and 5xx responses
 that arrive before the tee starts. After the first byte, errors surface to the
 client; there is no mid-stream replay.
+
+## The protocol seam
+
+Relay's hot path is OpenAI-shaped end to end, which is correct for every
+llama.cpp / vLLM / ollama box and wrong for an agent server. Rather than
+branch through `proxy.py`, an endpoint's `protocol` column selects an adapter
+(`app/services/adapters/`) exposing exactly two methods:
+
+- `probe(http, endpoint, timeout)` — what a health check *is*. `/models` for
+  OpenAI, `/global/health` + `/config/providers` for OpenCode. `health.py`
+  keeps the cadence and the state machine; only the request moved.
+- `forward(proxy, request, endpoint, path, record, body, t0)` — one
+  attempt, returning an OpenAI-shaped response.
+
+The interface is deliberately narrow. Everything *above* a single attempt —
+the concurrency gate, alias pinning, the failover loop, and the telemetry
+call sites (`_buffered_response`, `_stream_response`,
+`finalize_adapter_response`) — stays in `ProxyService` and is shared. An
+adapter that owned `handle()` would fork all of it, and the dashboard would
+start showing different columns depending on which upstream answered.
+
+Two consequences worth remembering:
+
+- **Adding a protocol means touching `health.py` too** — or rather, means
+  *not* touching it, as long as the new adapter implements `probe`.
+- **Non-`openai` protocols are alias-only.** `Router._eligible`, the manual
+  pin in `resolve()`, and the first-endpoint auto-pin in `create()` all
+  exclude them, so an agent server is only ever reached by a caller that
+  named it. Alias-pinned requests already never fail over, which is the
+  behavior we want and comes free.
+
+`services/adapters/passthrough.py` is a verbatim extraction of the original
+code paths — the refactor that introduced this seam changed no behavior and
+left all 91 prior tests untouched.
 
 ## Stale `model_override` self-healing
 

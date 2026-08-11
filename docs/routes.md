@@ -23,9 +23,9 @@ declarations:
 | Method | Path | Notes |
 | --- | --- | --- |
 | POST | `/v1/chat/completions` | primary; streaming + non-streaming, fully instrumented (`route: "chat.completions"`) |
-| POST | `/v1/completions` | instrumented |
-| POST | `/v1/embeddings` | instrumented |
-| GET | `/v1/models` | **synthesized by relay**, never forwarded: `auto` + every enabled endpoint alias |
+| POST | `/v1/completions` | instrumented; `501` if the resolved endpoint's protocol doesn't implement it |
+| POST | `/v1/embeddings` | instrumented; `501` if the resolved endpoint's protocol doesn't implement it |
+| GET | `/v1/models` | **synthesized by relay**, never forwarded: `auto` + every enabled endpoint alias + every endpoint's `available_models` |
 | ANY | `/v1/{path}` | generic passthrough, recorded coarsely under its path name |
 
 ## Backend — control plane

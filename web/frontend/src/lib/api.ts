@@ -59,6 +59,7 @@ export const api = {
   endpoints: () => get<EndpointOut[]>('/admin/endpoints'),
   createEndpoint: (body: {
     name: string; base_url: string; server_type: string;
+    protocol?: 'openai' | 'opencode'; available_models?: string[];
     upstream_key?: string | null; priority?: number;
     alias?: string | null; model_override?: string | null;
     tunnel_command?: string | null; tunnel_local_port?: number | null;

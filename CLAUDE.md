@@ -66,8 +66,10 @@ backend changes and `npm run build` + `relay restart` picks up frontend ones.
   `src/lib/styles.ts`. No Tailwind, no component library. Poll with
   `usePoll`, never a hand-rolled `setInterval`. UI actions should call
   `log.*` so they land in the backend log stream.
-- Screens are one module each. `Endpoints.tsx` (~850 lines) is the ceiling —
-  extract before exceeding it.
+- Screens are one module each. ~850 lines is the ceiling — extract before
+  exceeding it (`Endpoints.tsx` shed its add/edit forms into
+  `EndpointForm.tsx` for exactly this reason; add endpoint fields there, once,
+  not twice).
 - Comments explain non-obvious decisions. Several load-bearing ones are
   already documented in place (why bodies are zlib BLOBs, why histogram edges
   are frozen, why in-flight tracking starts before the concurrency gate) —
@@ -93,16 +95,30 @@ backend changes and `npm run build` + `relay restart` picks up frontend ones.
   every `include_router` call in `main.py`.
 - **Rollups are never pruned**, only raw `requests` rows are. Aggregate
   history outlives raw retention by design.
+- **A new upstream protocol is an adapter, not a branch.** Add it under
+  `app/services/adapters/` and register it in that package's `__init__`;
+  `protocol` on `endpoints` is the only dispatch key (`kind` gets overwritten,
+  `server_type` is cosmetic). Implementing `probe` is what keeps `health.py`
+  from needing a change. Non-`openai` protocols are alias-only — `_eligible`,
+  the manual pin, and the first-endpoint auto-pin in `router.py` all exclude
+  them, and there are tests asserting each.
+- **`Router.create` inserts positionally.** Its `row` dict key order must
+  match the explicit column list in the INSERT right below it.
 
 ## Testing
 
-91 tests in `tests/backend/`, all against a fake upstream ASGI app
-(`fake_upstream.py`) — no real model server or SSH host required. Tunnel
-lifecycle is tested with an injectable fake command, since real SSH can't be
-exercised in CI.
+125 tests in `tests/backend/`, all against fake upstream ASGI apps
+(`fake_upstream.py`, routed by hostname: `good` / `strict` / `opencode` /
+`flaky` / dead) — no real model server, agent server, or SSH host required.
+Tunnel lifecycle is tested with an injectable fake command, since real SSH
+can't be exercised in CI.
 
 When adding a proxy or router behavior, add the case to `test_proxy.py` or
 `test_router.py` rather than only validating by hand against a live server.
+
+Note that `httpx.ASGITransport` ignores request timeouts, so a deadline that
+must hold in tests has to be enforced by relay (`asyncio.wait_for`), not
+handed to the HTTP client — see `adapters/opencode.py`.
 
 ## Skills worth reaching for
 

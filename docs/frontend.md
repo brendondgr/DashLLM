@@ -15,10 +15,12 @@ index.astro → Base.astro (fonts, global CSS, keyframes, hover classes)
     │                           chart grid, by-endpoint breakdown
     ├── screens/Requests.tsx    filter chips, search, expandable request table
     │                           (polls /admin/stats/recent at 1.5s)
-    ├── screens/Endpoints.tsx   endpoint cards, add/edit form, alias +
-    │                           model_override, test, set-active, inline
+    ├── screens/Endpoints.tsx   endpoint cards, test, set-active, inline
     │                           terminal for interactive tunnel connect,
     │                           saved tunnel routes, ~/.ssh/config host picker
+    ├── screens/EndpointForm.tsx  the shared add/edit form: name, type,
+    │                           alias, url, key, model allowlist; derives
+    │                           `protocol` from the type select
     ├── screens/SshTunnel.tsx   structured tunnel form, generated command,
     │                           PTY session panel, test log, active tunnels
     ├── screens/ProxyInfo.tsx   base URL, API key reveal/copy/regenerate,
@@ -131,7 +133,8 @@ There is no layout B — the former "Timeline" preset was removed.
 
 - Inline React style objects; shared values come from `styles.ts` rather than
   being repeated. No Tailwind or component library.
-- Screens are separate modules. `Endpoints.tsx` is the largest at ~850 lines;
-  prefer extracting before growing a screen past that.
+- Screens are separate modules; ~850 lines is the ceiling. `Endpoints.tsx`
+  hit it and shed its add/edit forms into `EndpointForm.tsx` — new endpoint
+  fields go there once, not into two near-duplicate JSX blocks.
 - UI actions call `log.*(...)` so they reach the backend log stream.
 - `usePoll` pauses while the tab is hidden — don't hand-roll `setInterval`.

@@ -1,6 +1,9 @@
 # Plan: OpenCode as a relay endpoint
 
-Status: **proposal, not implemented.**
+Status: **implemented.** See [opencode.md](../opencode.md) for the shipped
+feature and [plan-opencode-endpoint-execution.md](plan-opencode-endpoint-execution.md)
+for the work list and the deltas from this design (notably `available_models`,
+which this document predates).
 
 Goal: in the dashboard's *Add Endpoint* form, pick type **OpenCode**, give it an
 alias like `agent`, and have `POST :4000/v1/chat/completions` with

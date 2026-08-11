@@ -45,7 +45,9 @@ All stats endpoints also accept optional `endpoint_id` and `model` filters.
 {
   "id": "uuid", "name": "llama.cpp · local", "alias": "local",
   "kind": "local|remote_direct|remote_tunnel",
-  "server_type": "llama.cpp|vLLM|ollama|openai",
+  "server_type": "llama.cpp|vLLM|ollama|openai|opencode",
+  "protocol": "openai|opencode",
+  "available_models": [],
   "base_url": "http://127.0.0.1:7070/v1",
   "has_key": false,
   "tunnel_id": null,
@@ -59,10 +61,36 @@ All stats endpoints also accept optional `endpoint_id` and `model` filters.
 }
 ```
 
-`model` is discovered from the endpoint's `/v1/models` by the health prober.
-`share` is that endpoint's fraction of requests in the window. `active` marks
-the router's manual pin. `kind` is inferred from the URL and tunnel fields
-when not supplied. Writes accept `upstream_key` (never returned).
+`model` is discovered by the health prober (from `/v1/models`, or
+`/config/providers` for `protocol: "opencode"`). `share` is that endpoint's
+fraction of requests in the window. `active` marks the router's manual pin.
+`kind` is inferred from the URL and tunnel fields when not supplied. Writes
+accept `upstream_key` (never returned).
+
+`protocol` is the wire protocol relay speaks to the upstream and the only
+field any backend code branches on — `server_type` remains a cosmetic badge
+and `kind` is topology, re-derived on every PATCH. Endpoints whose `protocol`
+is not `openai` are **alias-only**: never resolved for `model: "auto"`, never
+a failover target, never the default pin. See [opencode.md](opencode.md).
+
+### Model allowlist (`available_models`)
+
+An explicit list of model ids an endpoint serves, protocol-agnostic. Ids match
+`^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,127}$`, are deduped case-insensitively,
+and must not collide with `auto`, another endpoint's alias, or another
+endpoint's allowlist (`422` if they do). Every entry:
+
+- is advertised in `GET /v1/models` as its own model, `owned_by`
+  `relay:<endpoint name>`;
+- **routes to that endpoint** when a client sends it as `model`, with the id
+  forwarded upstream **verbatim** — it outranks `model_override`, since
+  naming a model is the point of asking for it;
+- narrows the endpoint's discovered catalog, so the default `model` is always
+  one the operator permitted. An allowlisted id the prober did not report is
+  still offered (a provider catalog can lag what the provider serves).
+
+Send `[]` to clear it. This is what makes one OpenCode server fronting many
+provider models individually addressable.
 
 ### Model-alias routing
 
@@ -74,10 +102,11 @@ before forwarding, so the client never needs to know what is actually running
 there. Alias-pinned requests do **not** fail over. `model: "auto"` (or any
 non-alias value) uses the normal pin / priority-failover resolution.
 
-`GET /v1/models` is synthesized by relay: it lists `auto` plus every enabled
-endpoint's alias, each carrying `relay.endpoint`, `relay.health`, and
-`relay.upstream_model` metadata, so OpenAI clients can discover the routing
-names.
+`GET /v1/models` is synthesized by relay: it lists `auto`, every enabled
+endpoint's alias, and every id in an enabled endpoint's `available_models` —
+each carrying `relay.endpoint`, `relay.health`, `relay.protocol`, and
+`relay.upstream_model` metadata. Everything listed is routable: sending any of
+these ids back as `model` reaches the endpoint that advertised it.
 
 ### Tunnel (structured, supervised)
 ```json
