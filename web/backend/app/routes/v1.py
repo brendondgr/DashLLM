@@ -30,8 +30,21 @@ async def proxy_v1(request: Request, path: str) -> Response:
         shared_ok = bool(key) and hmac.compare_digest(
             key, request.app.state.settings.api_key)
         if not shared_ok and request.app.state.users.by_api_key(key) is None:
-            log.warning("client auth rejected", extra={"data": {
-                "path": path,
-                "client": request.client.host if request.client else None}})
-            raise HTTPException(401, "invalid API key")
+            log.warning(
+                "client auth rejected; /v1 requires a Bearer key because"
+                " RELAY_REQUIRE_CLIENT_KEY=1. Set it to 0 to open /v1, or"
+                " send the key printed by ./launch.sh.",
+                extra={"data": {
+                    "path": path, "key_supplied": bool(key),
+                    "client": request.client.host if request.client else None}})
+            # Name the setting in the response too. Which auth mode a proxy is
+            # in is not a secret, and "invalid API key" with three different
+            # credentials in play (admin password, signup code, client key)
+            # sends people looking at the wrong one.
+            raise HTTPException(401, (
+                "invalid API key: /v1 requires 'Authorization: Bearer <key>'"
+                " because RELAY_REQUIRE_CLIENT_KEY=1"
+                if key else
+                "missing API key: /v1 requires 'Authorization: Bearer <key>'"
+                " because RELAY_REQUIRE_CLIENT_KEY=1"))
     return await request.app.state.proxy.handle(request, path)
