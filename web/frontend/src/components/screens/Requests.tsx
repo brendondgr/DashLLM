@@ -188,13 +188,19 @@ function RequestRowItem({ row, expanded, onToggle }: RowProps) {
 
 // ── main component ───────────────────────────────────────────────────────────
 
-export default function Requests(): React.JSX.Element {
+interface Props {
+  /** Carried by api.ts; passed in only so switching it re-triggers the poll.
+   * The backend self-scopes this feed for non-admins regardless. */
+  scope?: string;
+}
+
+export default function Requests({ scope = 'all' }: Props): React.JSX.Element {
   const [chip, setChip] = useState<Chip>('all');
   const [search, setSearch] = useState('');
   const [expandedId, setExpandedId] = useState<string | null>(null);
 
   const fetcher = useCallback(() => api.recent(90), []);
-  const { data } = usePoll<RecentResponse>(fetcher, 1500);
+  const { data } = usePoll<RecentResponse>(fetcher, 1500, [scope]);
 
   const rows = data?.rows ?? [];
   const counts = data?.counts ?? { all: 0, streaming: 0, done: 0, error: 0 };

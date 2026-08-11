@@ -2,6 +2,8 @@
  * shipped to the backend log stream (POST /admin/logs/frontend), so client
  * actions are auditable next to proxy/router/tunnel events. */
 
+import { csrfHeaders } from './session';
+
 type Level = 'debug' | 'info' | 'warn' | 'error';
 
 interface Pending {
@@ -21,7 +23,8 @@ async function flush(): Promise<void> {
   try {
     await fetch('/admin/logs/frontend', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...csrfHeaders() },
+      credentials: 'same-origin',
       body: JSON.stringify({ events }),
       keepalive: true,
     });

@@ -21,14 +21,17 @@ from app.routes import (
     admin_settings,
     admin_stats,
     admin_tunnels,
+    auth,
     v1,
 )
+from app.security import admin_configured, is_loopback_bind
 from app.services.health import HealthProber
 from app.services.proxy import ProxyService
 from app.services.router import Router
 from app.services.settings_store import SettingsStore
 from app.services.stats import StatsService
 from app.services.telemetry import LiveTracker, TelemetryWriter
+from app.services.users import UserStore
 from app.services.tunnel_sessions import TunnelSessionManager
 from app.services.tunnels import TunnelManager
 
@@ -51,6 +54,10 @@ async def _housekeeping(app: FastAPI) -> None:
                 await app.state.telemetry.prune(retention)
             except Exception:
                 log.exception("retention prune failed")
+            try:
+                await asyncio.to_thread(app.state.users.sweep_sessions)
+            except Exception:
+                log.exception("session sweep failed")
 
 
 @asynccontextmanager
@@ -68,7 +75,7 @@ async def lifespan(app: FastAPI):
     app.state.proxy = ProxyService(
         app.state.http, app.state.router, app.state.telemetry,
         app.state.live, app.state.settings,
-        max_concurrency=cfg.max_concurrency)
+        max_concurrency=cfg.max_concurrency, users=app.state.users)
     app.state.tunnels = TunnelManager(app.state.db, app.state.http)
     app.state.tunnel_sessions = TunnelSessionManager()
     await app.state.telemetry.start()
@@ -103,13 +110,40 @@ async def lifespan(app: FastAPI):
         log.info("relay stopped")
 
 
+def _check_auth_config(cfg: Config) -> None:
+    """Fail closed on a reachable bind.
+
+    An unauthenticated relay hands out every endpoint's upstream key, the SSH
+    tunnel commands, the proxy key, and every stored prompt. On loopback that
+    is a reasonable dev default; on any other interface it is a breach waiting
+    to be indexed, so refuse to start rather than log a warning nobody reads.
+    """
+    if not admin_configured(cfg) and not is_loopback_bind(cfg):
+        raise RuntimeError(
+            f"refusing to start: RELAY_HOST={cfg.host} is publicly reachable"
+            " but no admin credential is set. Set RELAY_ADMIN_PASSWORD_HASH"
+            " (uv run python -m app.services.users hash '<password>') or"
+            " RELAY_ADMIN_TOKEN.")
+    if cfg.admin_password and not cfg.admin_password_hash:
+        log.warning(
+            "RELAY_ADMIN_PASSWORD is stored in plaintext; prefer"
+            " RELAY_ADMIN_PASSWORD_HASH")
+    if not cfg.cookie_secure and not is_loopback_bind(cfg):
+        log.warning(
+            "RELAY_COOKIE_SECURE=0 on a public bind: session cookies will be"
+            " sent over plain HTTP")
+
+
 def create_app(cfg: Config | None = None) -> FastAPI:
     cfg = cfg or config
     setup_logging(cfg.log_dir, cfg.log_level)
+    _check_auth_config(cfg)
 
     app = FastAPI(title="relay", version=__version__, lifespan=lifespan)
     app.state.cfg = cfg
     app.state.db = Database(cfg.db_path)
+    app.state.users = UserStore(
+        app.state.db, session_ttl_hours=cfg.session_ttl_hours)
     app.state.settings = SettingsStore(
         app.state.db, boot_port=cfg.port, api_key=cfg.api_key)
     app.state.telemetry = TelemetryWriter(app.state.db)
@@ -121,12 +155,16 @@ def create_app(cfg: Config | None = None) -> FastAPI:
 
     @app.middleware("http")
     async def cors_and_access_log(request: Request, call_next):
-        # Dynamic CORS honoring the live "allow_cors" setting; admin/stats
-        # traffic is same-origin so this mainly serves /v1 browser clients.
-        if request.method == "OPTIONS" and app.state.settings.current.allow_cors:
+        # Dynamic CORS honoring the live "allow_cors" setting, scoped to /v1.
+        # The admin and auth planes are same-origin and cookie-authenticated,
+        # so a wildcard origin on them would be handing any website a template
+        # for driving this dashboard.
+        wants_cors = (app.state.settings.current.allow_cors
+                      and request.url.path.startswith("/v1"))
+        if request.method == "OPTIONS" and wants_cors:
             return Response(status_code=204, headers=_cors_headers())
         response = await call_next(request)
-        if app.state.settings.current.allow_cors:
+        if wants_cors:
             for k, v in _cors_headers().items():
                 response.headers.setdefault(k, v)
         return response
@@ -135,7 +173,7 @@ def create_app(cfg: Config | None = None) -> FastAPI:
         return {
             "Access-Control-Allow-Origin": "*",
             "Access-Control-Allow-Methods": "GET, POST, PATCH, PUT, DELETE, OPTIONS",
-            "Access-Control-Allow-Headers": "Authorization, Content-Type, X-Admin-Token",
+            "Access-Control-Allow-Headers": "Authorization, Content-Type",
         }
 
     @app.get("/health")
@@ -147,8 +185,11 @@ def create_app(cfg: Config | None = None) -> FastAPI:
         }
 
     app.include_router(v1.router)
+    app.include_router(auth.router)
+    app.include_router(auth.admin_router)
     app.include_router(admin_endpoints.router)
     app.include_router(admin_settings.router)
+    app.include_router(admin_settings.logs_router)
     app.include_router(admin_stats.router)
     app.include_router(admin_tunnels.router)
 

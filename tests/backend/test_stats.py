@@ -210,3 +210,81 @@ async def test_custom_range(db, stats):
     s = await stats.summary(None, from_ts=now - 4 * 86400,
                             to_ts=now - 2 * 86400)
     assert s["requests"] == 1
+
+
+# ---- per-user scoping -----------------------------------------------------
+def _seed_user(db, ts, user_id, **kw):
+    """Seed a raw row owned by ``user_id``. Deliberately does NOT maintain the
+    rollups: rollup tables carry no user dimension, so a scoped query that
+    accidentally read them would come back empty and give this test teeth."""
+    rid = f"req_{ts}_{user_id}"
+    db.execute(
+        "INSERT INTO requests (id, ts, endpoint_id, endpoint_name, route,"
+        " model, stream, status, ok, prompt_tokens, completion_tokens,"
+        " total_tokens, ttft_ms, latency_ms, tokens_per_sec, cost_usd, user_id)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (rid, ts, kw.get("ep", "ep-a"), kw.get("ep", "ep-a"),
+         "chat.completions", kw.get("model", "m1"), 1, 200, 1,
+         100, 50, 150, 80.0, 1000.0, 50.0, 0.0, user_id))
+    return rid
+
+
+async def test_summary_scopes_to_one_user(stats, db):
+    now = time.time()
+    for i in range(3):
+        _seed_user(db, now - 60 - i, "user-a")
+    _seed_user(db, now - 30, "user-b")
+
+    assert (await stats.summary("24h", user_id="user-a"))["requests"] == 3
+    assert (await stats.summary("24h", user_id="user-b"))["requests"] == 1
+    assert (await stats.summary("24h", user_id="user-c"))["requests"] == 0
+
+
+async def test_scoped_queries_bypass_the_rollup_tables(stats, db):
+    """The load-bearing detail of the whole design: request_rollup_hourly is
+    keyed (bucket_hour, endpoint_id, model) with no user column, so a scoped
+    query must fall back to raw rows. These seeds have no rollup entries at
+    all — if the rollup path were taken, every count would be zero."""
+    now = time.time()
+    _seed_user(db, now - 3600 * 24 * 5, "user-a")  # 30d window -> rollup path
+    assert (await stats.summary("30d", user_id="user-a"))["requests"] == 1
+    assert (await stats.summary("30d"))["requests"] == 0, \
+        "unscoped 30d reads rollups, which these seeds never populated"
+
+    by_model = await stats.by_model("30d", user_id="user-a")
+    assert by_model["source"][0][1] == 1
+    by_ep = await stats.by_endpoint("30d", user_id="user-a")
+    assert by_ep["source"][0][1] == 1
+    assert sum(r[1] for r in
+               (await stats.tokens_by_day("30d", user_id="user-a"))["source"]) == 100
+    assert sum(r[1] for r in
+               (await stats.tokens_by_hour("30d", user_id="user-a"))["source"]) == 100
+    assert sum(r[1] for r in
+               (await stats.volume("30d", user_id="user-a"))["source"]) == 1
+    lat = await stats.latency("30d", user_id="user-a")
+    assert any(r[1] for r in lat["source"]), "scoped latency needs raw samples"
+
+
+async def test_recent_never_leaks_another_users_rows(stats, db):
+    now = time.time()
+    _seed_user(db, now - 10, "user-a", model="alice-model")
+    _seed_user(db, now - 5, "user-b", model="bob-model")
+
+    mine = await stats.recent(user_id="user-a")
+    assert [r["model"] for r in mine["rows"]] == ["alice-model"]
+    everyone = await stats.recent()
+    assert {r["model"] for r in everyone["rows"]} == {"alice-model", "bob-model"}
+
+
+def test_live_snapshot_counts_only_the_callers_requests():
+    from app.services.telemetry import LiveTracker
+
+    live = LiveTracker()
+    live.start("r1", {"ts": time.time(), "user_id": "user-a"})
+    live.start("r2", {"ts": time.time(), "user_id": "user-b"})
+    live.start("r3", {"ts": time.time(), "user_id": None})
+
+    assert live.snapshot(18)["in_flight"] == 3
+    assert live.snapshot(18, user_id="user-a")["in_flight"] == 1
+    # The series stays global: it describes relay's saturation, not traffic.
+    assert live.snapshot(18, user_id="user-a")["series"] == live.snapshot(18)["series"]

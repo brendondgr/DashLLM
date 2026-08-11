@@ -238,5 +238,53 @@ Percentiles in `summary` are exact (computed from raw rows) for spans up to
   a key baked into client configs keeps matching. Regenerating from the
   dashboard still works but only holds until the next restart, and logs a
   warning saying so.
-- **Admin plane `/admin/*`** — `X-Admin-Token` header, enforced only when
-  `RELAY_ADMIN_TOKEN` is set. Compared with `hmac.compare_digest`.
+- **Admin plane `/admin/*`** — an admin session cookie, or the legacy
+  `X-Admin-Token` header (kept for scripts). Split in two by guard:
+  `admin_guard` on endpoints/tunnels/settings/proxy/users, `user_guard` on
+  `/admin/stats/*` and `POST /admin/logs/frontend`.
+
+  With no admin credential configured, the admin plane stays open on a
+  **loopback** bind (the local-dev default) and `create_app` **refuses to
+  start** on any other bind.
+- **Dashboard sessions** — `relay_session` (HttpOnly, `SameSite=Lax`, `Secure`
+  unless `RELAY_COOKIE_SECURE=0`) plus a readable `relay_csrf`. Mutating
+  requests made with the cookie must echo the CSRF value in `X-Relay-CSRF`;
+  header-token callers are exempt. Only SHA-256 hashes of session tokens are
+  stored.
+
+## Auth routes
+
+- `GET /auth/status` → `{authenticated, signup_enabled, me}`. The only route
+  the login screen may call anonymously.
+- `POST /auth/login` `{username, password}` → `MeOut`, sets session cookies.
+  401 on failure, 429 after 10 failed attempts from one IP in 15 minutes.
+- `POST /auth/signup` `{username, password, code}` → `{api_key,
+  api_key_prefix}` (201). 403 unless `RELAY_SIGNUP_CODE` is set and matches;
+  409 on a duplicate or admin username; password minimum 12 characters. **The
+  cleartext key is returned exactly once** — only its hash is stored.
+- `POST /auth/logout` → 204, revokes the session server-side.
+- `GET /auth/me` → `{kind, username, user_id, private, api_key_prefix, csrf}`.
+- `PATCH /auth/me` `{private}` → `MeOut`. 400 for the admin.
+- `POST /auth/me/key` → a fresh `{api_key, api_key_prefix}`; the old key stops
+  working immediately.
+- `GET /admin/users` → `UserOut[]` (admin only).
+- `PATCH /admin/users/{id}` `{private?, disabled?}` → `UserOut`. Disabling an
+  account also kills its live sessions.
+
+## Per-user attribution and stats scope
+
+`/v1` requests carrying a user's `rk_` key are stamped with `user_id`. An
+unknown or missing key is **not** an error — the request proceeds and stays
+unattributed, which also denies an attacker an oracle for probing live keys.
+Credential-looking body keys (`user_pass`, `password`, `api_key`, …) are
+stripped before telemetry capture and before the body is forwarded upstream.
+
+`/admin/stats/*` accepts `scope` ∈ {`all` (default), `me`}:
+
+- Aggregate endpoints honour `scope=me` by filtering on `user_id`. A user's
+  traffic still counts toward the shared `scope=all` totals — privacy here
+  means unattributed, not excluded.
+- `/recent` and `/live` are **always** self-scoped for a non-admin, whatever
+  `scope` says.
+- A scoped query never reads the rollup tables (they carry no user dimension),
+  so per-user history is bounded by `retention_days`.

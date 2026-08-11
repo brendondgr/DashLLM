@@ -25,7 +25,7 @@ from fastapi import Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from app.core.logging import get_logger
-from app.security import extract_bearer, mask_key
+from app.security import extract_bearer, mask_key, redact
 from app.services.adapters import (
     HOP_BY_HOP as _HOP_BY_HOP,
     RetryableUpstreamError as _RetryableUpstreamError,
@@ -116,12 +116,15 @@ def _collect_stream_text(buf: bytes) -> str:
 
 class ProxyService:
     def __init__(self, http: httpx.AsyncClient, router, telemetry, live,
-                 settings, max_concurrency: int = 18):
+                 settings, max_concurrency: int = 18, users=None):
         self.http = http
         self.router = router
         self.telemetry = telemetry
         self.live = live
         self.settings = settings
+        # Injected like every other collaborator rather than read off
+        # request.app, so the service stays usable with a bare ASGI scope.
+        self.users = users
         self.max_concurrency = max_concurrency
         self._slots = asyncio.Semaphore(max_concurrency)
 
@@ -131,13 +134,26 @@ class ProxyService:
         started_ts = time.time()
         req_id = "req_" + uuid.uuid4().hex[:8]
         route = _route_name(path)
-        client_key = mask_key(extract_bearer(request))
+        raw_key = extract_bearer(request)
+        client_key = mask_key(raw_key)
+        # Attribution is best-effort by design: an unknown or absent key is not
+        # an error, it just leaves the request in the general population. That
+        # also denies an attacker an oracle for probing which keys are live.
+        owner = self.users.by_api_key(raw_key) if self.users else None
+        user_id = owner["id"] if owner else None
 
         if route == "models" and request.method == "GET":
             return self._models_catalog()
 
         body_bytes = await request.body()
         body_json = self._parse_json(body_bytes)
+        if body_json is not None:
+            # Credential-looking keys never survive the front door: relay
+            # persists bodies to request_bodies and re-serializes them to the
+            # upstream, so a client improvising {"user_pass": …} would
+            # otherwise write its password to disk and ship it to every model
+            # server and agent host in the pool.
+            body_json = redact(body_json)
 
         # Model routing: a request whose "model" names an endpoint alias, or a
         # model in an endpoint's declared allowlist, is pinned to that
@@ -173,7 +189,7 @@ class ProxyService:
 
         record = RequestRecord(
             id=req_id, ts=started_ts, route=route, stream=want_stream,
-            client_key=client_key,
+            client_key=client_key, user_id=user_id,
             model=(body_json or {}).get("model"),
             temperature=(body_json or {}).get("temperature"),
             max_tokens=(body_json or {}).get("max_tokens")
@@ -200,6 +216,7 @@ class ProxyService:
         self.live.start(req_id, {
             "ts": started_ts, "model": record.model, "route": route,
             "stream": want_stream, "client_key": client_key,
+            "user_id": user_id,
             "endpoint_name": None, "temperature": record.temperature,
             "max_tokens": record.max_tokens})
         stream_owns_finish = False

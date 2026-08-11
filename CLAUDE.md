@@ -80,6 +80,21 @@ backend changes and `npm run build` + `relay restart` picks up frontend ones.
 - **The API contract is written three times.** `app/schemas/__init__.py`,
   `web/frontend/src/lib/types.ts`, and `docs/api-contract.md`. Change one,
   change all three.
+- **There are two auth planes, and a new router must pick one.** `admin_guard`
+  for anything exposing upstream keys, SSH commands, or the proxy key;
+  `user_guard` for anything a signed-in non-admin may read. A handler behind
+  `user_guard` must scope its own queries with `Principal.scope_user_id` —
+  passing the guard is not authorization to read another user's rows. Filtering
+  the sidebar in `App.tsx` is cosmetic and never the enforcement point.
+- **`admin_guard` is open only on a loopback bind with nothing configured.**
+  That exemption is what keeps local dev (and the test suite, which uses the
+  default `host=127.0.0.1`) working. `create_app` raises on a non-loopback bind
+  with no admin credential, so the exemption can never apply to a reachable
+  port — don't "fix" one without the other.
+- **Rollup tables have no user dimension**, and SQLite cannot alter a primary
+  key. `_use_rollup` therefore returns False whenever a query is user-scoped;
+  any new stats method that branches on rollups must do the same or it will
+  silently return zeros for per-user views.
 - **Bucket granularity is written twice.** `_TS_BUCKETS` in
   `app/services/stats.py` and `GRAN` in `screens/Dashboard.tsx`.
 - **`histogram.METRICS` is an on-disk format version.** Its bucket edges are

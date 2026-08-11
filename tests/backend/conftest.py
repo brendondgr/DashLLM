@@ -37,6 +37,55 @@ def client(app):
         yield c
 
 
+ADMIN_PASSWORD = "correct horse battery staple"
+SIGNUP_CODE = "let-me-in-please"
+
+
+@pytest.fixture
+def auth_cfg(tmp_path) -> Config:
+    """Config with auth actually turned on, unlike ``cfg`` which models the
+    loopback-open local-dev default."""
+    from app.services.users import hash_password
+
+    return Config(
+        db_path=tmp_path / "test.db",
+        log_dir=tmp_path / "logs",
+        frontend_dist=tmp_path / "no-dist",
+        probe_interval=9999,
+        admin_user="admin",
+        admin_password_hash=hash_password(ADMIN_PASSWORD),
+        signup_code=SIGNUP_CODE,
+        cookie_secure=False,  # TestClient speaks plain http
+    )
+
+
+@pytest.fixture
+def auth_client(auth_cfg):
+    with TestClient(create_app(auth_cfg)) as c:
+        yield c
+
+
+def login_admin(client) -> None:
+    r = client.post("/auth/login",
+                    json={"username": "admin", "password": ADMIN_PASSWORD})
+    assert r.status_code == 200, r.text
+    _arm_csrf(client)
+
+
+def signup_user(client, username: str, password: str = "hunter2hunter2") -> str:
+    """Registers and logs in as ``username``; returns the cleartext API key."""
+    r = client.post("/auth/signup", json={
+        "username": username, "password": password, "code": SIGNUP_CODE})
+    assert r.status_code == 201, r.text
+    _arm_csrf(client)
+    return r.json()["api_key"]
+
+
+def _arm_csrf(client) -> None:
+    """Mirror what api.ts does: echo the readable CSRF cookie in a header."""
+    client.headers["X-Relay-CSRF"] = client.cookies.get("relay_csrf", "")
+
+
 @pytest.fixture
 def proxy_env(cfg):
     """App wired to a fake upstream via a routing transport.
