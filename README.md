@@ -80,7 +80,7 @@ root/
 │       │   └── hooks/       # usePoll
 │       ├── astro.config.mjs
 │       └── package.json
-├── tests/backend/           # pytest suite (133 tests)
+├── tests/backend/           # pytest suite (136 tests)
 ├── utils/                   # seed_telemetry.py
 ├── scripts/                 # dev.sh, relay, install-systemd.sh, validate_live.sh
 └── deploy/systemd/          # relay.service (systemd user unit)

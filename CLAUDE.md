@@ -107,7 +107,7 @@ backend changes and `npm run build` + `relay restart` picks up frontend ones.
 
 ## Testing
 
-125 tests in `tests/backend/`, all against fake upstream ASGI apps
+136 tests in `tests/backend/`, all against fake upstream ASGI apps
 (`fake_upstream.py`, routed by hostname: `good` / `strict` / `opencode` /
 `flaky` / dead) — no real model server, agent server, or SSH host required.
 Tunnel lifecycle is tested with an injectable fake command, since real SSH

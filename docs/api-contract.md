@@ -232,5 +232,11 @@ Percentiles in `summary` are exact (computed from raw rows) for spans up to
   locally against the stored proxy key and **never forwarded**; the target
   endpoint's own key is injected instead. `Authorization` is in the
   hop-by-hop strip list, so it cannot leak upstream even when auth is off.
+
+  The proxy key is generated on first boot and persisted. Set `RELAY_API_KEY`
+  to pin a known value instead — it wins over the stored one at every boot, so
+  a key baked into client configs keeps matching. Regenerating from the
+  dashboard still works but only holds until the next restart, and logs a
+  warning saying so.
 - **Admin plane `/admin/*`** — `X-Admin-Token` header, enforced only when
   `RELAY_ADMIN_TOKEN` is set. Compared with `hmac.compare_digest`.

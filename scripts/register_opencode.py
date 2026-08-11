@@ -7,9 +7,13 @@ up; also useful on its own after editing ``.env``:
 
     set -a; . ./.env; set +a; python3 scripts/register_opencode.py
 
+``--list-models`` instead prints the ``provider/model`` ids the OpenCode server
+offers, for pasting into ``OPENCODE_MODELS``.
+
 Standard library only — this runs before/outside the backend's venv.
 """
 
+import base64
 import json
 import os
 import sys
@@ -21,6 +25,46 @@ TIMEOUT = 15.0
 
 def env(name: str, default: str = "") -> str:
     return (os.environ.get(name) or default).strip()
+
+
+def opencode_get(path: str) -> dict:
+    """GET from the OpenCode server with the Basic credentials from .env."""
+    user = env("OPENCODE_SERVER_USERNAME", "opencode")
+    password = env("OPENCODE_SERVER_PASSWORD")
+    url = f"http://127.0.0.1:{env('OPENCODE_PORT', '4096')}{path}"
+    req = urllib.request.Request(url)
+    token = base64.b64encode(f"{user}:{password}".encode()).decode()
+    req.add_header("Authorization", f"Basic {token}")
+    with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+        return json.loads(resp.read())
+
+
+def list_models() -> int:
+    try:
+        data = opencode_get("/config/providers")
+    except (urllib.error.URLError, json.JSONDecodeError, OSError) as e:
+        print(f"could not read the provider catalog: {e}", file=sys.stderr)
+        return 1
+
+    ids: list[str] = []
+    for provider in data.get("providers") or []:
+        pid = provider.get("id")
+        models = provider.get("models")
+        names = (list(models) if isinstance(models, dict)
+                 else [m.get("id") for m in (models or []) if isinstance(m, dict)])
+        ids.extend(f"{pid}/{m}" for m in names if pid and m)
+
+    if not ids:
+        print("  (this server reports no models — is a provider configured?)")
+        return 0
+    for mid in sorted(ids):
+        print(f"  {mid}")
+    default = data.get("default")
+    if isinstance(default, dict) and default:
+        pid, mid = next(iter(default.items()))
+        print(f"\n  server default: {pid}/{mid}")
+    print(f"\n  OPENCODE_MODELS={','.join(sorted(ids))}")
+    return 0
 
 
 def api(method: str, path: str, payload: dict | None = None) -> tuple[int, dict | list | None]:
@@ -46,6 +90,9 @@ def api(method: str, path: str, payload: dict | None = None) -> tuple[int, dict 
 
 
 def main() -> int:
+    if "--list-models" in sys.argv[1:]:
+        return list_models()
+
     password = env("OPENCODE_SERVER_PASSWORD")
     if not password:
         print("OPENCODE_SERVER_PASSWORD is empty; refusing to register an "

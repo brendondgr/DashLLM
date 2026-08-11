@@ -24,6 +24,18 @@ def _wait_rows(app, n, timeout=3.0) -> list[dict]:
     raise AssertionError(f"telemetry rows never reached {n}")
 
 
+def _wait_bodies(app, n, timeout=3.0) -> list[dict]:
+    """Same, for request_bodies — written after the requests row, so it needs
+    its own wait rather than piggybacking on _wait_rows."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        rows = app.state.db.query("SELECT * FROM request_bodies")
+        if len(rows) >= n:
+            return rows
+        time.sleep(0.02)
+    raise AssertionError(f"request_bodies never reached {n}")
+
+
 def test_non_streaming_passthrough_and_telemetry(proxy_env):
     client, app, calls = proxy_env
     _register(client, "good", "http://good/v1")
@@ -259,8 +271,10 @@ def test_bodies_captured_only_when_enabled(proxy_env):
     client.post("/v1/chat/completions", json={
         "model": "fake-model-7b",
         "messages": [{"role": "user", "content": "logged prompt"}]})
-    _wait_rows(app, 2)
-    bodies = app.state.db.query("SELECT * FROM request_bodies")
+    # Wait on request_bodies, not requests: the writer inserts the metadata row
+    # first and the body row in a second statement, so waiting on `requests`
+    # alone races the body write and fails intermittently under load.
+    bodies = _wait_bodies(app, 1)
     assert len(bodies) == 1
     # Bodies are stored zlib-compressed (telemetry.body_pack), so read them
     # back through the inverse rather than asserting on the raw BLOB.

@@ -8,6 +8,7 @@
 #   ./launch.sh --list-models   # print the models your OpenCode server offers
 #                               # (for OPENCODE_MODELS) and exit
 #   ./launch.sh --takeover      # stop the relay systemd service first
+#   ./launch.sh --env-file PATH # use a different config (default: ./.env)
 #
 # Both processes run in the foreground as children of this script: Ctrl-C
 # stops both. For a boot-time setup use the systemd unit instead
@@ -19,26 +20,32 @@ cd "$ROOT"
 
 LIST_MODELS=0
 TAKEOVER=0
-for arg in "$@"; do
-  case "$arg" in
+ENV_FILE=".env"
+while [ $# -gt 0 ]; do
+  case "$1" in
     --list-models) LIST_MODELS=1 ;;
     --takeover) TAKEOVER=1 ;;
+    --env-file) ENV_FILE="${2:?--env-file needs a path}"; shift ;;
+    --env-file=*) ENV_FILE="${1#*=}" ;;
     # the header comment block above is the help text
     -h|--help) awk 'NR>1 && /^#/ {sub(/^# ?/,""); print; next} NR>1 {exit}' "$0"; exit 0 ;;
-    *) echo "unknown option: $arg" >&2; exit 2 ;;
+    *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
+  shift
 done
 
 # ---- config -------------------------------------------------------------
-if [ ! -f .env ]; then
-  echo "no .env found. Start from the template:" >&2
+if [ ! -f "$ENV_FILE" ]; then
+  echo "no $ENV_FILE found. Start from the template:" >&2
   echo "  cp .env.example .env" >&2
   exit 1
 fi
-# set -a exports everything sourced, so the values reach both child processes.
+# set -a exports everything sourced, so the values reach both child processes:
+# relay reads RELAY_*, and `opencode serve` reads OPENCODE_SERVER_* plus
+# whatever provider key its configured providers look for.
 set -a
 # shellcheck disable=SC1091
-. ./.env
+. "$ENV_FILE"
 set +a
 
 RELAY_PORT="${RELAY_PORT:-4000}"
@@ -112,15 +119,10 @@ fi
 if [ "$LIST_MODELS" = "1" ]; then
   echo
   echo "Models offered by this OpenCode server (for OPENCODE_MODELS in .env):"
-  curl -fsS -u "$OPENCODE_SERVER_USERNAME:$OPENCODE_SERVER_PASSWORD" \
-    "http://127.0.0.1:$OPENCODE_PORT/config/providers" \
-  | python3 -c '
-import json, sys
-d = json.load(sys.stdin)
-for p in d.get("providers", []):
-    for mid in (p.get("models") or {}):
-        print(f"  {p[\"id\"]}/{mid}")
-print("\ndefault:", d.get("default"))'
+  # Delegated to the helper rather than an inline python -c: quoting a Python
+  # f-string inside a single-quoted bash string is a trap, and the helper
+  # already knows how to read .env and talk to the server.
+  python3 "$ROOT/scripts/register_opencode.py" --list-models
   exit 0
 fi
 

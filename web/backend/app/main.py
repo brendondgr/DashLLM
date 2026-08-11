@@ -110,7 +110,8 @@ def create_app(cfg: Config | None = None) -> FastAPI:
     app = FastAPI(title="relay", version=__version__, lifespan=lifespan)
     app.state.cfg = cfg
     app.state.db = Database(cfg.db_path)
-    app.state.settings = SettingsStore(app.state.db, boot_port=cfg.port)
+    app.state.settings = SettingsStore(
+        app.state.db, boot_port=cfg.port, api_key=cfg.api_key)
     app.state.telemetry = TelemetryWriter(app.state.db)
     app.state.live = LiveTracker()
     app.state.router = Router(

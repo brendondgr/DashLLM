@@ -26,6 +26,11 @@ class Config(BaseSettings):
 
     admin_token: str = ""  # empty = admin plane open (localhost use)
     require_client_key: bool = False  # enforce Bearer key on /v1/*
+    # Pin the client-facing proxy key instead of letting relay generate one on
+    # first boot. Set it when the key has to be known ahead of time — baked
+    # into client configs, shared with a teammate, checked into a secret store.
+    # Empty keeps the generate-once-and-persist behavior.
+    api_key: str = ""
 
     # Health prober
     probe_interval: float = 15.0

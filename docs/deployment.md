@@ -40,6 +40,7 @@ Settings screen. An `.env` file in `web/backend/` is also read.
 | `RELAY_LOG_LEVEL` | `INFO` | log verbosity |
 | `RELAY_ADMIN_TOKEN` | *(empty = open)* | admin plane auth (`X-Admin-Token`) |
 | `RELAY_REQUIRE_CLIENT_KEY` | `false` | enforce `Authorization: Bearer` on `/v1/*` |
+| `RELAY_API_KEY` | *(empty = generated)* | pin the client key instead of generating one on first boot |
 | `RELAY_PROBE_INTERVAL` | `15` | seconds between active health probes |
 | `RELAY_PROBE_TIMEOUT` | `5` | probe timeout |
 | `RELAY_UNHEALTHY_AFTER` | `3` | consecutive failures → `failed` (out of rotation) |

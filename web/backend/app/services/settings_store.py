@@ -24,9 +24,10 @@ def _generate_api_key() -> str:
 
 
 class SettingsStore:
-    def __init__(self, db: Database, boot_port: int):
+    def __init__(self, db: Database, boot_port: int, api_key: str = ""):
         self.db = db
         self.started_at = time.time()
+        self._pinned_api_key = (api_key or "").strip()
         self._settings = self._load(boot_port)
         self._api_key = self._load_api_key()
 
@@ -59,6 +60,17 @@ class SettingsStore:
         )
 
     def _load_api_key(self) -> str:
+        # RELAY_API_KEY wins over whatever is stored: the environment is the
+        # declared intent, and a key you can't predict is useless when it has
+        # to be baked into client configs. Persisted anyway so the dashboard
+        # and /admin/proxy report the key actually in force.
+        if self._pinned_api_key:
+            self.db.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                (_API_KEY_KEY, self._pinned_api_key),
+            )
+            log.info("proxy API key pinned from RELAY_API_KEY")
+            return self._pinned_api_key
         row = self.db.query_one(
             "SELECT value FROM settings WHERE key = ?", (_API_KEY_KEY,)
         )
@@ -102,6 +114,12 @@ class SettingsStore:
         return self._settings
 
     def regenerate_api_key(self) -> str:
+        if self._pinned_api_key:
+            # Allowed, but it only lasts until the next boot re-applies
+            # RELAY_API_KEY — say so rather than let it look permanent.
+            log.warning(
+                "regenerating a key that RELAY_API_KEY pins; the env value "
+                "will win again on restart")
         self._api_key = _generate_api_key()
         self.db.execute(
             "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",

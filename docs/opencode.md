@@ -65,6 +65,21 @@ agree on `RELAY_REQUIRE_CLIENT_KEY` and `RELAY_ADMIN_TOKEN` — but the unit's
 `ExecStart` pins its own `--port`, so `RELAY_PORT` only moves the port for
 `launch.sh`. Re-run `./scripts/install-systemd.sh` after pulling this change.
 
+### Three different keys
+
+Nothing about this setup is served by confusing them:
+
+| Key | In `.env` | Who checks it |
+| --- | --- | --- |
+| Relay's client key | `RELAY_API_KEY` | relay, on `/v1/*`, when `RELAY_REQUIRE_CLIENT_KEY=1`. Leave empty to have one generated; `launch.sh` prints it either way. |
+| OpenCode's server password | `OPENCODE_SERVER_USERNAME` / `OPENCODE_SERVER_PASSWORD` | `opencode serve`, as HTTP Basic. Relay presents it as the endpoint's `upstream_key`. |
+| The provider's API key | `OPENCODE_API_KEY`, `ANTHROPIC_API_KEY`, … | Anthropic/OpenAI/OpenCode Zen, when the agent calls the model. `launch.sh` exports these into the opencode process; the alternative is `opencode auth login`. |
+
+`./launch.sh --list-models` prints ids as `provider/model`, and the provider
+prefix tells you which of the third row you need — `opencode/…` wants
+`OPENCODE_API_KEY`, `anthropic/…` wants `ANTHROPIC_API_KEY`. A locally hosted
+provider usually needs none.
+
 To register an endpoint against an already-running relay without launching
 anything:
 
