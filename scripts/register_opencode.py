@@ -103,6 +103,11 @@ def main() -> int:
     name = env("OPENCODE_ENDPOINT_NAME", "opencode")
     alias = env("OPENCODE_ALIAS", "agent")
     models = [m.strip() for m in env("OPENCODE_MODELS").split(",") if m.strip()]
+    # Which model a bare `"model": "<alias>"` request runs on. Without this the
+    # alias falls through to the first model the probe discovered, which is
+    # whatever OpenCode happens to list first — not necessarily one you can
+    # actually bill.
+    default_model = env("OPENCODE_MODEL")
 
     spec = {
         "name": name,
@@ -114,6 +119,11 @@ def main() -> int:
         # adapters/opencode.py::_basic_auth.
         "upstream_key": f"{user}:{password}",
         "available_models": models,
+        # Empty string, not None: EndpointPatch drops None fields
+        # (exclude_none), so None could never *clear* an override that .env no
+        # longer sets. "" survives the patch and reads as unset everywhere,
+        # since router.upstream_model tests truthiness.
+        "model_override": default_model or "",
     }
 
     status, existing = api("GET", "/admin/endpoints")

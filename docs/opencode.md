@@ -159,8 +159,11 @@ With that list:
   client's model picker shows them.
 - `"model": "openai/gpt-5"` routes to this endpoint and forwards **exactly**
   that model — the list outranks `model_override`.
-- `"model": "agent"` uses the endpoint's default: `model_override` if set,
-  otherwise the first allowlisted id the probe confirmed.
+- `"model": "agent"` uses the endpoint's default: `model_override` (set from
+  `OPENCODE_MODEL` in `.env`) if present, otherwise the first allowlisted id
+  the probe confirmed. Set `OPENCODE_MODEL` — the discovered order is
+  OpenCode's, and the model it happens to list first may not be one your
+  account can bill.
 - The endpoint will not serve a model that is not on the list, and the ids
   cannot collide with another endpoint's alias or allowlist.
 
@@ -171,6 +174,17 @@ Clients may also pass a non-standard `"agent"` field (`build`, `plan`, a
 custom agent) in the request body; it is forwarded when present.
 
 ## Things that will bite you
+
+- **Agent turns are not cheap in prompt tokens.** OpenCode sends its system
+  prompt and tool definitions with every turn, so a one-word question bills
+  5,000–10,000 prompt tokens before your text is counted. That is inherent to
+  driving an agent, not relay overhead, but it shows up in the dashboard and
+  it is worth knowing before you point a chat UI at it.
+
+- **A provider error arrives as a `200` with `finish_reason: "error"`.** The
+  agent turn itself succeeded; the model call inside it failed. The detail is
+  in `relay.agent_error` on the response body (e.g. "No payment method"), and
+  the row lands in telemetry with zero tokens.
 
 - **Set `permission` explicitly.** A permission left at `"ask"` parks the turn
   waiting for a human answer that relay cannot give. Relay bounds it with a
