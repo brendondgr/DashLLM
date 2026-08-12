@@ -19,7 +19,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 def make_upstream() -> tuple[FastAPI, dict]:
     up = FastAPI()
     calls = {"chat": 0, "models": 0, "saw_include_usage": False,
-             "last_model": None, "last_body": None, "last_auth": None}
+             "last_model": None}
 
     @up.get("/v1/models")
     async def models():
@@ -31,10 +31,6 @@ def make_upstream() -> tuple[FastAPI, dict]:
         calls["chat"] += 1
         body = await request.json()
         calls["last_model"] = body.get("model")
-        # Recorded so tests can assert what actually crosses the wire: no
-        # client credentials in the body, no client bearer in the headers.
-        calls["last_body"] = body
-        calls["last_auth"] = request.headers.get("authorization")
         if body.get("stream"):
             include_usage = bool(
                 (body.get("stream_options") or {}).get("include_usage"))

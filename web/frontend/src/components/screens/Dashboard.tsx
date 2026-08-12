@@ -28,9 +28,6 @@ type LayoutId = 'A' | 'C';
 interface Props {
   live: LiveSnapshot | null;
   endpoints: EndpointOut[];
-  /** Which population the charts describe. The value itself is carried by
-   * api.ts; it is threaded in here only so a change re-triggers every poll. */
-  scope?: string;
 }
 
 const RANGES: [RangeId, string][] = [
@@ -66,7 +63,7 @@ const GRAN: Record<RangeId, Record<DetailLevel, string>> = {
 const isoDay = (offsetDays: number): string =>
   new Date(Date.now() - offsetDays * 864e5).toISOString().slice(0, 10);
 
-export default function Dashboard({ live, endpoints, scope = 'all' }: Props) {
+export default function Dashboard({ live, endpoints }: Props) {
   const [rangeId, setRangeId] = useState<RangeId>('24h');
   const [detail, setDetailState] = useState<DetailLevel>('summary');
   const [layout, setLayout] = useState<LayoutId>('A');
@@ -81,7 +78,7 @@ export default function Dashboard({ live, endpoints, scope = 'all' }: Props) {
       to: Date.parse(customTo) / 1000 + 86400,
     };
   }, [rangeId, customFrom, customTo]);
-  const rangeKey = `${rangeId}:${customFrom}:${customTo}:${scope}`;
+  const rangeKey = `${rangeId}:${customFrom}:${customTo}`;
   const statsInterval = rangeId === '1h' ? 2500 : 5000;
 
   const { data: summary } = usePoll(
@@ -92,7 +89,7 @@ export default function Dashboard({ live, endpoints, scope = 'all' }: Props) {
     () => api.tokensTimeseries(range, detail), statsInterval,
     [rangeKey, detail]);
   const { data: byHour } = usePoll(
-    () => api.tokensByHour({ id: '30d' }), 15000, [scope]);
+    () => api.tokensByHour({ id: '30d' }), 15000);
   const dailyRange: RangeSel =
     rangeId === '30d' || rangeId === '1y' || rangeId === 'custom'
       ? range : { id: '7d' };

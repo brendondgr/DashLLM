@@ -85,8 +85,7 @@ class StatsService:
     @staticmethod
     def _filters(endpoint_id: str | None, model: str | None,
                  start: float | None = None,
-                 end: float | None = None,
-                 user_id: str | None = None) -> tuple[str, list]:
+                 end: float | None = None) -> tuple[str, list]:
         clauses, params = [], []
         if start is not None:
             clauses.append("ts >= ?")
@@ -100,9 +99,6 @@ class StatsService:
         if model:
             clauses.append("model = ?")
             params.append(model)
-        if user_id:
-            clauses.append("user_id = ?")
-            params.append(user_id)
         return (" WHERE " + " AND ".join(clauses)) if clauses else "", params
 
     @staticmethod
@@ -121,17 +117,9 @@ class StatsService:
         return " WHERE " + " AND ".join(clauses), params
 
     @staticmethod
-    def _use_rollup(step: int, user_id: str | None = None) -> bool:
-        """Rollups are hourly; only the minute-bucketed 1h window needs raw.
-
-        A per-user query can never use them: ``request_rollup_hourly`` and
-        ``request_rollup_hist`` are keyed (bucket_hour, endpoint_id, model)
-        with no user dimension, and SQLite cannot alter a primary key. Scoped
-        queries therefore fall back to the raw ``requests`` table, which bounds
-        per-user history to ``retention_days``. That trade is deliberate — the
-        alternative is a parallel set of rollup tables.
-        """
-        return step == 3600 and not user_id
+    def _use_rollup(step: int) -> bool:
+        """Rollups are hourly; only the minute-bucketed 1h window needs raw."""
+        return step == 3600
 
     @staticmethod
     def _fill(start: float, end: float, step: int, fmt: str) -> list[str]:
@@ -220,13 +208,11 @@ class StatsService:
     async def _ts_agg(self, unit: str, start: float, end: float,
                       endpoint_id: str | None, model: str | None,
                       roll_select: str, raw_select: str,
-                      n_values: int,
-                      user_id: str | None = None) -> dict[str, list]:
+                      n_values: int) -> dict[str, list]:
         """Zero-filled timeseries summed into ``unit`` buckets. Rollup source
-        for hour-and-coarser units, raw rows for sub-hour units and for any
-        user-scoped query (rollups carry no user dimension)."""
+        for hour-and-coarser units, raw rows for sub-hour units."""
         acc = {k: [0] * n_values for k in self._fill_unit(start, end, unit)}
-        if unit in _ROLLUP_UNITS and not user_id:
+        if unit in _ROLLUP_UNITS:
             where, params = self._roll_where(endpoint_id, model, start, end)
             rows = await self.db.aquery(
                 f"SELECT bucket_hour, {roll_select} FROM request_rollup_hourly"
@@ -237,8 +223,7 @@ class StatsService:
                     for i in range(n_values):
                         acc[key][i] += r[f"v{i}"] or 0
         else:
-            where, params = self._filters(
-                endpoint_id, model, start, end, user_id)
+            where, params = self._filters(endpoint_id, model, start, end)
             expr = self._raw_bucket_expr(unit)
             rows = await self.db.aquery(
                 f"SELECT {expr} AS bucket, {raw_select} FROM requests"
@@ -267,13 +252,11 @@ class StatsService:
 
     # ---- endpoints ---------------------------------------------------------
     async def summary(self, window: str | None, from_ts=None, to_ts=None,
-                      endpoint_id=None, model=None, user_id=None) -> dict:
+                      endpoint_id=None, model=None) -> dict:
         start, end, step, _ = self._range(window, from_ts, to_ts)
-        # Histograms have no user dimension either, so a scoped query always
-        # takes the exact (raw-row) percentile path.
-        exact = (end - start) <= _EXACT_PCT_SPAN or bool(user_id)
+        exact = (end - start) <= _EXACT_PCT_SPAN
 
-        if self._use_rollup(step, user_id):
+        if self._use_rollup(step):
             where, params = self._roll_where(endpoint_id, model, start, end)
             agg = await self.db.aquery_one(
                 "SELECT COALESCE(SUM(n),0) AS requests,"
@@ -286,8 +269,7 @@ class StatsService:
                 " COALESCE(SUM(tps_n),0) AS tps_n"
                 f" FROM request_rollup_hourly{where}", params)
         else:
-            rwhere, rparams = self._filters(
-                endpoint_id, model, start, end, user_id)
+            rwhere, rparams = self._filters(endpoint_id, model, start, end)
             agg = await self.db.aquery_one(
                 "SELECT COUNT(*) AS requests,"
                 " SUM(CASE WHEN ok = 0 THEN 1 ELSE 0 END) AS errors,"
@@ -298,8 +280,7 @@ class StatsService:
                 f" FROM requests{rwhere}", rparams)
 
         if exact:
-            rwhere, rparams = self._filters(
-                endpoint_id, model, start, end, user_id)
+            rwhere, rparams = self._filters(endpoint_id, model, start, end)
             samples = await self.db.aquery(
                 "SELECT ttft_ms, latency_ms, tokens_per_sec"
                 f" FROM requests{rwhere}", rparams)
@@ -335,14 +316,12 @@ class StatsService:
         }
 
     async def volume(self, window, from_ts=None, to_ts=None,
-                     endpoint_id=None, model=None, detail="summary",
-                     user_id=None) -> dict:
+                     endpoint_id=None, model=None, detail="summary") -> dict:
         start, end, unit = self._ts_range(window, detail, from_ts, to_ts)
         buckets = await self._ts_agg(
             unit, start, end, endpoint_id, model,
             "SUM(n) AS v0, SUM(errors) AS v1",
-            "COUNT(*) AS v0, SUM(CASE WHEN ok = 0 THEN 1 ELSE 0 END) AS v1", 2,
-            user_id=user_id)
+            "COUNT(*) AS v0, SUM(CASE WHEN ok = 0 THEN 1 ELSE 0 END) AS v1", 2)
         return {
             "dimensions": ["time", "requests", "errors"],
             "source": [[k, *v] for k, v in buckets.items()],
@@ -350,23 +329,22 @@ class StatsService:
 
     async def tokens_timeseries(self, window, from_ts=None, to_ts=None,
                                 endpoint_id=None, model=None,
-                                detail="summary", user_id=None) -> dict:
+                                detail="summary") -> dict:
         start, end, unit = self._ts_range(window, detail, from_ts, to_ts)
         buckets = await self._ts_agg(
             unit, start, end, endpoint_id, model,
             "SUM(prompt_tokens) AS v0, SUM(completion_tokens) AS v1",
             "COALESCE(SUM(prompt_tokens), 0) AS v0,"
-            " COALESCE(SUM(completion_tokens), 0) AS v1", 2,
-            user_id=user_id)
+            " COALESCE(SUM(completion_tokens), 0) AS v1", 2)
         return {
             "dimensions": ["time", "input", "output"],
             "source": [[k, *v] for k, v in buckets.items()],
         }
 
     async def tokens_by_hour(self, window, from_ts=None, to_ts=None,
-                             endpoint_id=None, model=None, user_id=None) -> dict:
+                             endpoint_id=None, model=None) -> dict:
         start, end, step, _ = self._range(window or "30d", from_ts, to_ts)
-        if self._use_rollup(step, user_id):
+        if self._use_rollup(step):
             where, params = self._roll_where(endpoint_id, model, start, end)
             rows = await self.db.aquery(
                 "SELECT CAST(strftime('%H', bucket_hour, 'unixepoch',"
@@ -374,8 +352,7 @@ class StatsService:
                 " SUM(prompt_tokens) AS tin, SUM(completion_tokens) AS tout"
                 f" FROM request_rollup_hourly{where} GROUP BY hour", params)
         else:
-            where, params = self._filters(
-                endpoint_id, model, start, end, user_id)
+            where, params = self._filters(endpoint_id, model, start, end)
             rows = await self.db.aquery(
                 "SELECT CAST(strftime('%H', ts, 'unixepoch', 'localtime') AS"
                 " INTEGER) AS hour, COALESCE(SUM(prompt_tokens), 0) AS tin,"
@@ -390,9 +367,9 @@ class StatsService:
         return {"dimensions": ["hour", "input", "output"], "source": source}
 
     async def tokens_by_day(self, window, from_ts=None, to_ts=None,
-                            endpoint_id=None, model=None, user_id=None) -> dict:
+                            endpoint_id=None, model=None) -> dict:
         start, end, step, _ = self._range(window or "7d", from_ts, to_ts)
-        if self._use_rollup(step, user_id):
+        if self._use_rollup(step):
             where, params = self._roll_where(endpoint_id, model, start, end)
             rows = await self.db.aquery(
                 f"SELECT strftime('{_DAY_FMT}', bucket_hour, 'unixepoch',"
@@ -401,8 +378,7 @@ class StatsService:
                 f" FROM request_rollup_hourly{where} GROUP BY day"
                 " ORDER BY day", params)
         else:
-            where, params = self._filters(
-                endpoint_id, model, start, end, user_id)
+            where, params = self._filters(endpoint_id, model, start, end)
             rows = await self.db.aquery(
                 f"SELECT strftime('{_DAY_FMT}', ts, 'unixepoch', 'localtime')"
                 " AS day, COALESCE(SUM(prompt_tokens), 0) AS tin,"
@@ -417,9 +393,9 @@ class StatsService:
         return {"dimensions": ["date", "input", "output"], "source": source}
 
     async def by_model(self, window, from_ts=None, to_ts=None,
-                       endpoint_id=None, model=None, user_id=None) -> dict:
+                       endpoint_id=None, model=None) -> dict:
         start, end, step, _ = self._range(window, from_ts, to_ts)
-        if self._use_rollup(step, user_id):
+        if self._use_rollup(step):
             where, params = self._roll_where(endpoint_id, model, start, end)
             rows = await self.db.aquery(
                 "SELECT CASE WHEN model = '' THEN '—' ELSE model END AS model,"
@@ -433,8 +409,7 @@ class StatsService:
                  if r["tps_n"] else 0}
                 for r in rows]
         else:
-            where, params = self._filters(
-                endpoint_id, model, start, end, user_id)
+            where, params = self._filters(endpoint_id, model, start, end)
             rows = await self.db.aquery(
                 "SELECT COALESCE(model, '—') AS model, COUNT(*) AS requests,"
                 " COALESCE(SUM(total_tokens), 0) AS tokens,"
@@ -452,9 +427,9 @@ class StatsService:
         }
 
     async def by_endpoint(self, window, from_ts=None, to_ts=None,
-                          endpoint_id=None, model=None, user_id=None) -> dict:
+                          endpoint_id=None, model=None) -> dict:
         start, end, step, _ = self._range(window, from_ts, to_ts)
-        if self._use_rollup(step, user_id):
+        if self._use_rollup(step):
             where, params = self._roll_where(endpoint_id, model, start, end)
             rows = await self.db.aquery(
                 "SELECT COALESCE(MAX(endpoint_name), '—') AS endpoint,"
@@ -465,8 +440,7 @@ class StatsService:
                 f" FROM request_rollup_hourly{where} GROUP BY endpoint_id"
                 " ORDER BY requests DESC", params)
         else:
-            where, params = self._filters(
-                endpoint_id, model, start, end, user_id)
+            where, params = self._filters(endpoint_id, model, start, end)
             rows = await self.db.aquery(
                 "SELECT COALESCE(endpoint_name, '—') AS endpoint,"
                 " endpoint_id, COUNT(*) AS requests,"
@@ -485,12 +459,11 @@ class StatsService:
         }
 
     async def latency(self, window, from_ts=None, to_ts=None,
-                      endpoint_id=None, model=None, user_id=None) -> dict:
+                      endpoint_id=None, model=None) -> dict:
         start, end, step, fmt = self._range(window, from_ts, to_ts)
         keys = self._fill(start, end, step, fmt)
-        if (end - start) <= _EXACT_PCT_SPAN or user_id:
-            where, params = self._filters(
-                endpoint_id, model, start, end, user_id)
+        if (end - start) <= _EXACT_PCT_SPAN:
+            where, params = self._filters(endpoint_id, model, start, end)
             rows = await self.db.aquery(
                 f"SELECT strftime('{fmt}', ts, 'unixepoch', 'localtime') AS"
                 " bucket, ttft_ms, tokens_per_sec FROM requests" + where, params)
@@ -537,22 +510,13 @@ class StatsService:
             "source": source,
         }
 
-    async def recent(self, limit: int = 90, user_id: str | None = None) -> dict:
-        """Row-level request feed. ``user_id`` is a hard restriction, not a
-        display filter — it is what keeps one account's models, endpoints, and
-        timings out of another's view."""
+    async def recent(self, limit: int = 90) -> dict:
         limit = min(limit, 500)
-        if user_id:
-            db_rows = await self.db.aquery(
-                "SELECT * FROM requests WHERE user_id = ? ORDER BY ts DESC"
-                " LIMIT ?", (user_id, limit))
-        else:
-            db_rows = await self.db.aquery(
-                "SELECT * FROM requests ORDER BY ts DESC LIMIT ?", (limit,))
+        db_rows = await self.db.aquery(
+            "SELECT * FROM requests ORDER BY ts DESC LIMIT ?", (limit,))
         rows = []
-        live_rows = [r for r in self.live.in_flight.values()
-                     if not user_id or r.get("user_id") == user_id]
-        for info in sorted(live_rows, key=lambda r: -r.get("ts", 0)):
+        for info in sorted(self.live.in_flight.values(),
+                           key=lambda r: -r.get("ts", 0)):
             rows.append({
                 "id": info["id"], "ts": info.get("ts"),
                 "endpoint_name": info.get("endpoint_name"),

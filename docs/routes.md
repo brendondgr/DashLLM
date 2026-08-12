@@ -121,32 +121,8 @@ All `/admin/*` routes carry the `admin_guard` dependency.
 | `/live` | In-flight gauge + concurrency series |
 
 Common query params: `window` ∈ {`1h`,`24h`,`7d`,`30d`,`1y`,`all`} or
-`from`/`to` (unix seconds); optional `endpoint_id`, `model`, `scope`
-(`all`|`me`). `/recent` takes `limit`; `/live` takes none. Both are
-self-scoped for non-admins regardless of `scope`.
-
-## Auth
-
-`app/routes/auth.py`, prefixes `/auth` (unguarded) and `/admin/users`
-(`admin_guard`). See docs/api-contract.md for shapes.
-
-## Which guard each router carries
-
-| Router | Guard | Reachable by |
-| --- | --- | --- |
-| `v1` | client key (optional) | anyone, or key holders |
-| `auth.router` | none | anyone (login/signup/status) |
-| `auth.admin_router` | `admin_guard` | admin |
-| `admin_endpoints` | `admin_guard` | admin |
-| `admin_tunnels` | `admin_guard` | admin |
-| `admin_settings.router` | `admin_guard` | admin |
-| `admin_settings.logs_router` | `user_guard` | any signed-in account |
-| `admin_stats` | `user_guard` | any signed-in account, self-scoped |
-
-`admin_guard` and `user_guard` both allow everything when the bind is loopback
-and no admin credential is configured — the local-dev default. `create_app`
-refuses to start in that state on any non-loopback bind, so the exemption can
-never apply to a reachable port.
+`from`/`to` (unix seconds); optional `endpoint_id`, `model`. `/recent` takes
+only `limit`; `/live` takes none.
 
 ## Static dashboard
 

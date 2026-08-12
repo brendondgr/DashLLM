@@ -60,7 +60,6 @@ class RequestRecord(BaseModel):
     route: str = "unknown"
     model: str | None = None
     client_key: str | None = None  # masked (…last4)
-    user_id: str | None = None  # owner of the rk_ key, when one matched
     stream: bool = False
     status: int | None = None
     ok: bool = False
@@ -83,9 +82,8 @@ _INSERT = """
 INSERT OR REPLACE INTO requests (
   id, ts, endpoint_id, endpoint_name, route, model, client_key, stream,
   status, ok, error, prompt_tokens, completion_tokens, total_tokens,
-  ttft_ms, latency_ms, tokens_per_sec, cost_usd, temperature, max_tokens,
-  user_id
-) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+  ttft_ms, latency_ms, tokens_per_sec, cost_usd, temperature, max_tokens
+) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 """
 
 _INSERT_BODY = (
@@ -99,7 +97,7 @@ def _row(r: RequestRecord) -> tuple:
         r.client_key, int(r.stream), r.status, int(r.ok), r.error,
         r.prompt_tokens, r.completion_tokens, r.total_tokens, r.ttft_ms,
         r.latency_ms, r.tokens_per_sec, r.cost_usd, r.temperature,
-        r.max_tokens, r.user_id,
+        r.max_tokens,
     )
 
 
@@ -276,17 +274,9 @@ class LiveTracker:
         cutoff = time.time() - window_s
         return sum(1 for ts in self.clients.values() if ts > cutoff)
 
-    def snapshot(self, max_concurrency: int,
-                 user_id: str | None = None) -> dict:
-        """``user_id`` restricts the in-flight count to that user's requests.
-        The concurrency series stays global — it describes relay's saturation,
-        not anyone's traffic, and the header widget would be useless without
-        it."""
-        in_flight = (
-            sum(1 for r in self.in_flight.values() if r.get("user_id") == user_id)
-            if user_id else len(self.in_flight))
+    def snapshot(self, max_concurrency: int) -> dict:
         return {
-            "in_flight": in_flight,
+            "in_flight": len(self.in_flight),
             "max_concurrency": max_concurrency,
             "series": [list(p) for p in self.series],
         }

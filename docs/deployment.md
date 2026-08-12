@@ -38,14 +38,7 @@ Settings screen. An `.env` file in `web/backend/` is also read.
 | `RELAY_DB_PATH` | `web/backend/data/relay.db` | SQLite database |
 | `RELAY_LOG_DIR` | `web/backend/logs` | rotating JSON-lines logs |
 | `RELAY_LOG_LEVEL` | `INFO` | log verbosity |
-| `RELAY_ADMIN_TOKEN` | *(empty)* | legacy shared secret for scripts (`X-Admin-Token`) |
-| `RELAY_ADMIN_USER` | `admin` | admin login name |
-| `RELAY_ADMIN_PASSWORD_HASH` | *(empty)* | **preferred** admin credential; generate with the command below |
-| `RELAY_ADMIN_PASSWORD` | *(empty)* | plaintext admin password; works, but warns at boot |
-| `RELAY_SIGNUP_CODE` | *(empty = signup off)* | invite code required to register an account |
-| `RELAY_SESSION_TTL_HOURS` | `12` | dashboard session lifetime |
-| `RELAY_COOKIE_SECURE` | `true` | send session cookies only over HTTPS |
-| `RELAY_TRUSTED_PROXY` | `false` | honour `X-Forwarded-For` when rate-limiting logins |
+| `RELAY_ADMIN_TOKEN` | *(empty = open)* | admin plane auth (`X-Admin-Token`) |
 | `RELAY_REQUIRE_CLIENT_KEY` | `false` | enforce `Authorization: Bearer` on `/v1/*` |
 | `RELAY_API_KEY` | *(empty = generated)* | pin the client key instead of generating one on first boot |
 | `RELAY_PROBE_INTERVAL` | `15` | seconds between active health probes |
@@ -123,73 +116,18 @@ The endpoint registry lives in SQLite, not in code. Registered endpoints
 are reloaded at startup, so relay comes back knowing where each alias points —
 but tunnel-backed endpoints stay disconnected until you connect them.
 
-## Public deployment
-
-### TLS is a prerequisite, not a hardening step
-
-Passwords, session cookies, and proxy keys all cross the wire on every
-request. Over plain HTTP on a public host they are readable by anyone on the
-path, and no amount of application-side design changes that. Terminate TLS in
-a reverse proxy in front of relay and leave `RELAY_COOKIE_SECURE` at its
-default.
-
-### Set an admin credential
-
-```bash
-cd web/backend && uv run python -m app.services.users hash 'your admin password'
-```
-
-Put the output in `RELAY_ADMIN_PASSWORD_HASH`. Relay **refuses to start** on a
-non-loopback bind with no admin credential configured — a misconfigured public
-deploy fails loudly at boot instead of quietly serving your upstream keys.
-
-`RELAY_ADMIN_TOKEN` also satisfies that check, but it is a credential for
-*scripts* only: it authenticates an `X-Admin-Token` header, and a browser has
-no way to send one. A token-only config boots and warns that dashboard login
-is unavailable. Set the password hash as well if you want to sign in.
-
-**Upgrading an existing deployment:** if you already run with
-`RELAY_HOST=0.0.0.0` and no admin credential, relay will not start after this
-change until you set one — systemd retries, and every request during the loop
-is refused. Set the hash before restarting.
-
-### Decide who may register
-
-`RELAY_SIGNUP_CODE` is empty by default, which disables signup entirely. Set
-it to hand out accounts; each one carries a proxy key to your hardware, so
-open registration is a compute giveaway. Disable an account from the Users
-list — that also kills its live sessions.
-
-### Behind a reverse proxy
-
-Set `RELAY_TRUSTED_PROXY=1` **only** when relay really is behind a proxy you
-control. Otherwise any client can forge `X-Forwarded-For` and get a fresh
-login-attempt budget per request.
-
 ## Security posture
 
-- With no admin credential configured, the admin plane is open on a
-  **loopback** bind only — deliberate for a localhost tool — and startup fails
-  on any other bind. See above.
-- Two planes: `admin_guard` (endpoints, tunnels, settings, proxy info, users)
-  and `user_guard` (stats, self-scoped for non-admins). Hiding tabs in the UI
-  is cosmetic; the guards are the enforcement point.
-- Sessions are opaque random tokens; only SHA-256 hashes are stored, so a DB
-  dump does not yield session takeover. Passwords are scrypt; per-user proxy
-  keys are 256-bit and stored hashed, so a leaked DB yields nothing usable
-  against `/v1`.
-- Logins are rate-limited to 10 failures per IP per 15 minutes, counted in the
-  DB so a restart is not a free reset.
-- Cookie-authenticated mutations require a matching `X-Relay-CSRF` header on
-  top of `SameSite=Lax`.
+- Bind to localhost or LAN. For remote access, put an authenticating proxy
+  (Cloudflare Access or equivalent) in front and set `RELAY_ADMIN_TOKEN` plus
+  `RELAY_REQUIRE_CLIENT_KEY`.
+- The admin plane is **open by default** — an unset `RELAY_ADMIN_TOKEN` means
+  no auth. That is deliberate for a localhost tool; set it before exposing the
+  port anywhere.
 - `GET /admin/proxy` returns the client API key in full, so it is only as
   protected as the admin plane.
-- CORS `*` applies to `/v1` only. The cookie-authenticated admin and auth
-  planes never carry CORS headers.
-- Credential-looking keys in a proxied request body (`user_pass`, `password`,
-  `api_key`, …) are stripped before the body is stored or forwarded, so a
-  client that improvises them cannot write a password to `request_bodies` or
-  ship it to a model server.
+- CORS is `*` while `allow_cors` is on. Turn it off, or fix the admin plane,
+  before exposing the port.
 - Upstream keys are stored server-side and injected on forward. The caller's
   `Authorization` header is stripped as hop-by-hop, so a client key can never
   reach an upstream and an upstream key never reaches a client.

@@ -6,20 +6,13 @@ from fastapi import APIRouter, Depends, Request
 
 from app.core.logging import get_logger
 from app.schemas import FrontendLogBatch, RuntimeSettings, SettingsPatch
-from app.security import admin_guard, user_guard
+from app.security import admin_guard
 
 log = get_logger("admin")
 felog = get_logger("frontend")
 
 router = APIRouter(
     prefix="/admin", tags=["settings"], dependencies=[Depends(admin_guard)]
-)
-
-# Log *ingestion* is the one control-plane route a non-admin session needs: the
-# dashboard ships its own UI events here. It used to be unauthenticated, which
-# made it an anonymous unbounded INSERT on a public bind.
-logs_router = APIRouter(
-    prefix="/admin", tags=["settings"], dependencies=[Depends(user_guard)]
 )
 
 
@@ -70,7 +63,7 @@ async def regenerate_key(request: Request):
             "api_key_masked": request.app.state.settings.api_key_masked}
 
 
-@logs_router.post("/logs/frontend")
+@router.post("/logs/frontend")
 async def ingest_frontend_logs(request: Request, batch: FrontendLogBatch):
     """Everything the dashboard does lands in the server log stream + DB."""
     now = time.time()

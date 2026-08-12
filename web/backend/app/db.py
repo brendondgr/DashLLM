@@ -151,44 +151,6 @@ CREATE TABLE IF NOT EXISTS frontend_logs (
   event  TEXT NOT NULL,
   detail TEXT
 );
-
--- Dashboard accounts. The admin is NOT here: admin credentials live only in
--- the environment, so a writable DB can never mint an administrator.
--- password_hash is scrypt (see services/users.py); api_key_hash is the SHA-256
--- of the client's rk_ key, never the key itself, so a leaked DB yields nothing
--- usable against /v1.
-CREATE TABLE IF NOT EXISTS users (
-  id             TEXT PRIMARY KEY,
-  username       TEXT NOT NULL UNIQUE,
-  password_hash  TEXT NOT NULL,
-  api_key_hash   TEXT UNIQUE,
-  api_key_prefix TEXT,
-  private        INTEGER NOT NULL DEFAULT 0,
-  disabled       INTEGER NOT NULL DEFAULT 0,
-  created_ts     REAL
-);
-CREATE INDEX IF NOT EXISTS idx_users_apikey ON users(api_key_hash);
-
--- Server-side sessions. The cookie holds a random token; only its SHA-256 is
--- stored, so DB read access does not grant session takeover. subject is a
--- users.id, or the sentinel '__admin__' for the env-defined administrator.
-CREATE TABLE IF NOT EXISTS sessions (
-  token_hash TEXT PRIMARY KEY,
-  subject    TEXT NOT NULL,
-  is_admin   INTEGER NOT NULL DEFAULT 0,
-  csrf       TEXT NOT NULL,
-  created_ts REAL NOT NULL,
-  expires_ts REAL NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_sessions_exp ON sessions(expires_ts);
-
--- Failed login/signup attempts, for the per-IP sliding-window limiter. Kept in
--- the DB rather than memory so a restart is not a free reset for an attacker.
-CREATE TABLE IF NOT EXISTS auth_attempts (
-  ip TEXT NOT NULL,
-  ts REAL NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_auth_attempts ON auth_attempts(ip, ts);
 """
 
 
@@ -232,15 +194,6 @@ class Database:
         if "available_models" not in cols:
             self._conn.execute(
                 "ALTER TABLE endpoints ADD COLUMN available_models TEXT")
-
-        rcols = {
-            r[1] for r in self._conn.execute("PRAGMA table_info(requests)")
-        }
-        if "user_id" not in rcols:
-            self._conn.execute("ALTER TABLE requests ADD COLUMN user_id TEXT")
-        self._conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_requests_user ON requests(user_id)")
-
         # Backfill: an endpoint that already had a tunnel_command before
         # routes existed becomes its own "default" route, so upgrades don't
         # lose the working ssh command.

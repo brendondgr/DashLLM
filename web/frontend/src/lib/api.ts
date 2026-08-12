@@ -2,15 +2,11 @@
  * Every call is logged; failures are logged as errors and rethrown. */
 
 import { log } from './logger';
-import { csrfHeaders, notifyUnauthorized } from './session';
 import type {
-  ApiKeyOut,
-  AuthStatus,
   DetailLevel,
   EndpointOut,
   EndpointTestResult,
   LiveSnapshot,
-  MeOut,
   ProxyInfoOut,
   RangeSel,
   RecentResponse,
@@ -24,31 +20,15 @@ import type {
   TunnelRouteTestResult,
   TunnelSessionStatus,
   TunnelTestResult,
-  UserOut,
 } from './types';
-
-/** Paths whose 401 is an expected answer rather than an expired session — the
- * login screen asks them on purpose and must not bounce itself. */
-const ANONYMOUS_PATHS = ['/auth/status', '/auth/login', '/auth/signup'];
 
 async function req<T>(method: string, path: string, body?: unknown): Promise<T> {
   try {
     const res = await fetch(path, {
       method,
-      // Same-origin cookies carry the session; the CSRF token is echoed from
-      // its readable cookie so mutations pass the double-submit check.
-      credentials: 'same-origin',
-      headers: {
-        ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
-        ...csrfHeaders(),
-      },
+      headers: body !== undefined ? { 'Content-Type': 'application/json' } : undefined,
       body: body !== undefined ? JSON.stringify(body) : undefined,
     });
-    if (res.status === 401 && !ANONYMOUS_PATHS.includes(path)) {
-      // Session expired or was revoked mid-poll: drop straight to login rather
-      // than leaving a shell whose every request quietly fails.
-      notifyUnauthorized();
-    }
     if (!res.ok) {
       const text = await res.text();
       log.error('api.fail', `${method} ${path} -> ${res.status} ${text.slice(0, 200)}`);
@@ -74,28 +54,7 @@ export function rangeQuery(range: RangeSel): string {
   return `window=${range.id}`;
 }
 
-/** 'me' narrows aggregates to the caller's own traffic. The backend ignores it
- * for the admin and enforces it regardless for row-level feeds. */
-export type StatScope = 'all' | 'me';
-let scope: StatScope = 'all';
-export const setStatScope = (s: StatScope): void => { scope = s; };
-const sq = (): string => `&scope=${scope}`;
-
 export const api = {
-  // ---- auth ------------------------------------------------------------
-  authStatus: () => get<AuthStatus>('/auth/status'),
-  login: (username: string, password: string) =>
-    req<MeOut>('POST', '/auth/login', { username, password }),
-  signup: (username: string, password: string, code: string) =>
-    req<ApiKeyOut>('POST', '/auth/signup', { username, password, code }),
-  logout: () => req<void>('POST', '/auth/logout'),
-  me: () => get<MeOut>('/auth/me'),
-  setPrivate: (priv: boolean) => req<MeOut>('PATCH', '/auth/me', { private: priv }),
-  rotateMyKey: () => req<ApiKeyOut>('POST', '/auth/me/key'),
-  users: () => get<UserOut[]>('/admin/users'),
-  patchUser: (id: string, body: { private?: boolean; disabled?: boolean }) =>
-    req<UserOut>('PATCH', `/admin/users/${id}`, body),
-
   // ---- endpoints -----------------------------------------------------
   endpoints: () => get<EndpointOut[]>('/admin/endpoints'),
   createEndpoint: (body: {
@@ -178,23 +137,20 @@ export const api = {
     req<{ api_key: string; api_key_masked: string }>('POST', '/admin/proxy/key'),
 
   // ---- stats ---------------------------------------------------------------
-  summary: (r: RangeSel) =>
-    get<SummaryOut>(`/admin/stats/summary?${rangeQuery(r)}${sq()}`),
+  summary: (r: RangeSel) => get<SummaryOut>(`/admin/stats/summary?${rangeQuery(r)}`),
   volume: (r: RangeSel, detail: DetailLevel = 'summary') =>
-    get<StatsDataset>(`/admin/stats/volume?${rangeQuery(r)}&detail=${detail}${sq()}`),
+    get<StatsDataset>(`/admin/stats/volume?${rangeQuery(r)}&detail=${detail}`),
   tokensTimeseries: (r: RangeSel, detail: DetailLevel = 'summary') =>
     get<StatsDataset>(
-      `/admin/stats/tokens/timeseries?${rangeQuery(r)}&detail=${detail}${sq()}`),
+      `/admin/stats/tokens/timeseries?${rangeQuery(r)}&detail=${detail}`),
   tokensByHour: (r: RangeSel) =>
-    get<StatsDataset>(`/admin/stats/tokens/by-hour?${rangeQuery(r)}${sq()}`),
+    get<StatsDataset>(`/admin/stats/tokens/by-hour?${rangeQuery(r)}`),
   tokensByDay: (r: RangeSel) =>
-    get<StatsDataset>(`/admin/stats/tokens/by-day?${rangeQuery(r)}${sq()}`),
-  byModel: (r: RangeSel) =>
-    get<StatsDataset>(`/admin/stats/by-model?${rangeQuery(r)}${sq()}`),
+    get<StatsDataset>(`/admin/stats/tokens/by-day?${rangeQuery(r)}`),
+  byModel: (r: RangeSel) => get<StatsDataset>(`/admin/stats/by-model?${rangeQuery(r)}`),
   byEndpoint: (r: RangeSel) =>
-    get<StatsDataset>(`/admin/stats/by-endpoint?${rangeQuery(r)}${sq()}`),
-  latency: (r: RangeSel) =>
-    get<StatsDataset>(`/admin/stats/latency?${rangeQuery(r)}${sq()}`),
+    get<StatsDataset>(`/admin/stats/by-endpoint?${rangeQuery(r)}`),
+  latency: (r: RangeSel) => get<StatsDataset>(`/admin/stats/latency?${rangeQuery(r)}`),
   recent: (limit = 90) => get<RecentResponse>(`/admin/stats/recent?limit=${limit}`),
   live: () => get<LiveSnapshot>('/admin/stats/live'),
 };

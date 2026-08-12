@@ -84,13 +84,13 @@ failover may land on an endpoint running a different model.
 | Config | `app/config.py` | pydantic-settings, `RELAY_*` env vars; boot-time values only |
 | Runtime settings | `app/services/settings_store.py` | DB-backed mutable toggles + the client API key |
 | Logging | `app/core/logging.py` | rotating file + console, JSON lines |
-| Auth | `app/security.py` + `app/services/users.py` + `app/routes/auth.py` | two guards (`admin_guard` / `user_guard`), principals, sessions, scrypt passwords, per-user proxy keys, CSRF, body redaction |
+| Auth | `app/security.py` | `admin_guard` dependency, bearer extraction, key masking |
 | Storage | `app/db.py` | SQLite (WAL), additive column migrations, one-time rollup backfill |
 | Proxy | `app/services/proxy.py` + `app/routes/v1.py` | streaming tee, TTFT, usage capture, pre-first-byte retry, stale-override self-heal |
 | Protocol adapters | `app/services/adapters/` | per-`protocol` probe + forward; `passthrough` (OpenAI) and `opencode` (agent sessions) |
 | Router | `app/services/router.py` | registry, alias + allowlist routing, health state machine, tunnel routes |
 | Health | `app/services/health.py` | probe cadence + state feed; the probe request itself comes from the adapter |
-| Stats | `app/services/stats.py` + `app/routes/admin_stats.py` | ECharts-shaped aggregates over rollups and raw rows; user-scoped queries force the raw path |
+| Stats | `app/services/stats.py` + `app/routes/admin_stats.py` | ECharts-shaped aggregates over rollups and raw rows |
 | Rollups | `app/services/rollup.py`, `app/services/histogram.py` | hourly pre-aggregation + log-spaced percentile histograms |
 | Telemetry | `app/services/telemetry.py` | asyncio queue, off-hot-path writes, `LiveTracker`, retention pruning |
 | Structured tunnels | `app/services/tunnels.py` + `app/routes/admin_tunnels.py` | argv `ssh` children, supervisor with backoff, two-level test |
@@ -100,33 +100,6 @@ failover may land on an endpoint running a different model.
 | Screens | `web/frontend/src/components/screens/*.tsx` | one module per screen |
 | Charts | `web/frontend/src/components/EChart.tsx`, `src/lib/chartOptions.ts` | echarts/core, canvas renderer |
 | API client | `web/frontend/src/lib/api.ts`, `src/hooks/usePoll.ts` | typed fetchers + polling |
-
-## Access control
-
-Two planes, both enforced server-side:
-
-- **Admin** — credentials come from the environment only
-  (`RELAY_ADMIN_USER` + `RELAY_ADMIN_PASSWORD_HASH`), never from the database,
-  so write access to `relay.db` cannot mint an administrator. Reaches
-  endpoints, tunnels, settings, proxy info, users, and all telemetry.
-- **User** — a row in `users`, created through invite-code signup. Reaches
-  `/admin/stats/*` only, and row-level feeds are filtered to its own traffic.
-
-A dashboard session is an opaque random token in an HttpOnly cookie; the DB
-stores only its SHA-256, alongside a CSRF token that cookie-authenticated
-mutations must echo in `X-Relay-CSRF`.
-
-On the client plane, a user's `rk_` key both authenticates (when
-`RELAY_REQUIRE_CLIENT_KEY` is on) and attributes: the proxy resolves it to a
-`user_id` stamped on the telemetry row. Resolution is an in-memory map on
-`UserStore`, refreshed on every mutation, so the hot path never hits SQLite for
-it. An unrecognised key is not an error — the request proceeds unattributed.
-
-Privacy is **attribution-only**: a user's traffic still counts toward the
-shared aggregate totals, and only that user (and the admin) can see it broken
-out as theirs. That is what lets the rollup tables stay untouched — they carry
-no user dimension, so any user-scoped query falls back to raw `requests` rows
-and is bounded by `retention_days`.
 
 ## Health-state machine
 
