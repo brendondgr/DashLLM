@@ -17,20 +17,15 @@ class Config(BaseSettings):
         env_prefix="RELAY_", env_file=".env", extra="ignore"
     )
 
-    host: str = "127.0.0.1"
+    # Reachable from the network by default: the point of this relay is to be
+    # an endpoint other machines can call. Set RELAY_HOST=127.0.0.1 to keep it
+    # on this host only. There is no auth layer — see docs/deployment.md.
+    host: str = "0.0.0.0"
     port: int = 4000
 
     db_path: Path = BACKEND_DIR / "data" / "relay.db"
     log_dir: Path = BACKEND_DIR / "logs"
     log_level: str = "INFO"
-
-    admin_token: str = ""  # empty = admin plane open (localhost use)
-    require_client_key: bool = False  # enforce Bearer key on /v1/*
-    # Pin the client-facing proxy key instead of letting relay generate one on
-    # first boot. Set it when the key has to be known ahead of time — baked
-    # into client configs, shared with a teammate, checked into a secret store.
-    # Empty keeps the generate-once-and-persist behavior.
-    api_key: str = ""
 
     # Health prober
     probe_interval: float = 15.0

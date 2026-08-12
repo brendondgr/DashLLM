@@ -80,16 +80,18 @@ async def lifespan(app: FastAPI):
     log.info("relay started", extra={"data": {
         "version": __version__, "port": app.state.cfg.port,
         "db": str(app.state.cfg.db_path)}})
-    # An agent endpoint runs shell commands and edits files on its host by
-    # design, so an unauthenticated relay in front of one is an open remote
-    # shell. Loud, once, at boot — quietly proxying it would be worse.
+    # relay has no auth layer, and an agent endpoint runs shell commands and
+    # edits files on its host by design. On a non-loopback bind that makes the
+    # port a remote shell for anyone who can reach it. Loud, once, at boot —
+    # quietly proxying it would be worse.
     agents = [r["name"] for r in app.state.router.endpoints.values()
               if (r.get("protocol") or "openai") != "openai"]
-    if agents and not cfg.require_client_key:
+    if agents and cfg.host not in ("127.0.0.1", "::1", "localhost"):
         log.warning(
-            "agent endpoints are reachable without a client key; set"
-            " RELAY_REQUIRE_CLIENT_KEY=1",
-            extra={"data": {"endpoints": agents}})
+            "agent endpoints are reachable, unauthenticated, from the network:"
+            " anyone who can reach this port can run shell commands on the"
+            " OpenCode host. Set RELAY_HOST=127.0.0.1 to keep it local.",
+            extra={"data": {"endpoints": agents, "host": cfg.host}})
     try:
         yield
     finally:
@@ -110,8 +112,7 @@ def create_app(cfg: Config | None = None) -> FastAPI:
     app = FastAPI(title="relay", version=__version__, lifespan=lifespan)
     app.state.cfg = cfg
     app.state.db = Database(cfg.db_path)
-    app.state.settings = SettingsStore(
-        app.state.db, boot_port=cfg.port, api_key=cfg.api_key)
+    app.state.settings = SettingsStore(app.state.db, boot_port=cfg.port)
     app.state.telemetry = TelemetryWriter(app.state.db)
     app.state.live = LiveTracker()
     app.state.router = Router(

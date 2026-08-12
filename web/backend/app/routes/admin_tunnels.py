@@ -1,6 +1,6 @@
 """Control plane: SSH tunnel CRUD, lifecycle, tests, command display."""
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request
 
 from app.schemas import (
     TunnelCreate,
@@ -10,13 +10,9 @@ from app.schemas import (
     TunnelSessionStatus,
     TunnelTestResult,
 )
-from app.security import admin_guard
 from app.services.tunnels import command_string
 
-router = APIRouter(
-    prefix="/admin/tunnels", tags=["tunnels"],
-    dependencies=[Depends(admin_guard)]
-)
+router = APIRouter(prefix="/admin/tunnels", tags=["tunnels"])
 
 
 def _session_key(tid: str) -> str:

@@ -2,18 +2,15 @@
 
 import time
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Request
 
 from app.core.logging import get_logger
 from app.schemas import FrontendLogBatch, RuntimeSettings, SettingsPatch
-from app.security import admin_guard
 
 log = get_logger("admin")
 felog = get_logger("frontend")
 
-router = APIRouter(
-    prefix="/admin", tags=["settings"], dependencies=[Depends(admin_guard)]
-)
+router = APIRouter(prefix="/admin", tags=["settings"])
 
 
 @router.get("/settings", response_model=RuntimeSettings)
@@ -44,23 +41,20 @@ async def proxy_info(request: Request):
     live = request.app.state.live
     row = await request.app.state.db.aquery_one(
         "SELECT COUNT(*) AS n FROM requests")
+    # Built from the Host header the dashboard was loaded over, not from
+    # 127.0.0.1: the copy button on the Proxy screen should hand you a URL
+    # that works from the machine you are reading it on.
+    host = (request.headers.get("host") or "").split(",")[0].strip()
+    origin = f"{request.url.scheme}://{host}" if host else str(
+        request.base_url).rstrip("/")
     return {
-        "base_url": f"http://127.0.0.1:{st.current.proxy_port}/v1",
+        "base_url": f"{origin}/v1",
         "port": st.current.proxy_port,
-        "api_key": st.api_key,
-        "api_key_masked": st.api_key_masked,
         "uptime_s": round(st.uptime_s(), 1),
         "requests_total": (row["n"] if row else 0) + len(live.in_flight),
         "active_clients": live.active_clients(),
         "db_size_bytes": _db_size_bytes(request.app.state.cfg.db_path),
     }
-
-
-@router.post("/proxy/key")
-async def regenerate_key(request: Request):
-    key = request.app.state.settings.regenerate_api_key()
-    return {"api_key": key,
-            "api_key_masked": request.app.state.settings.api_key_masked}
 
 
 @router.post("/logs/frontend")

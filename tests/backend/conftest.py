@@ -15,7 +15,6 @@ def cfg(tmp_path) -> Config:
         log_dir=tmp_path / "logs",
         frontend_dist=tmp_path / "no-dist",
         probe_interval=9999,  # tests drive probes manually
-        admin_token="",
     )
 
 

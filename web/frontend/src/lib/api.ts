@@ -133,8 +133,6 @@ export const api = {
   updateSettings: (patch: Record<string, unknown>) =>
     req<RuntimeSettings>('PUT', '/admin/settings', patch),
   proxyInfo: () => get<ProxyInfoOut>('/admin/proxy'),
-  regenerateKey: () =>
-    req<{ api_key: string; api_key_masked: string }>('POST', '/admin/proxy/key'),
 
   // ---- stats ---------------------------------------------------------------
   summary: (r: RangeSel) => get<SummaryOut>(`/admin/stats/summary?${rangeQuery(r)}`),

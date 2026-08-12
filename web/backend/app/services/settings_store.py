@@ -1,11 +1,9 @@
 """Runtime-mutable settings persisted in the ``settings`` table.
 
 Loaded once at boot into memory; every change is persisted and logged.
-Also owns the client-facing proxy API key (generated on first boot).
 """
 
 import json
-import secrets
 import time
 
 from app.core.logging import get_logger
@@ -14,22 +12,15 @@ from app.schemas import RuntimeSettings, SettingsPatch
 
 log = get_logger("settings")
 
-_API_KEY_KEY = "api_key"
 _SETTINGS_KEY = "runtime"
 _BOOT_PORT_KEY = "boot_port"
 
 
-def _generate_api_key() -> str:
-    return "sk-relay-" + secrets.token_urlsafe(18)
-
-
 class SettingsStore:
-    def __init__(self, db: Database, boot_port: int, api_key: str = ""):
+    def __init__(self, db: Database, boot_port: int):
         self.db = db
         self.started_at = time.time()
-        self._pinned_api_key = (api_key or "").strip()
         self._settings = self._load(boot_port)
-        self._api_key = self._load_api_key()
 
     # -- load / persist -------------------------------------------------
     def _load(self, boot_port: int) -> RuntimeSettings:
@@ -59,44 +50,10 @@ class SettingsStore:
             (_SETTINGS_KEY, json.dumps(payload)),
         )
 
-    def _load_api_key(self) -> str:
-        # RELAY_API_KEY wins over whatever is stored: the environment is the
-        # declared intent, and a key you can't predict is useless when it has
-        # to be baked into client configs. Persisted anyway so the dashboard
-        # and /admin/proxy report the key actually in force.
-        if self._pinned_api_key:
-            self.db.execute(
-                "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
-                (_API_KEY_KEY, self._pinned_api_key),
-            )
-            log.info("proxy API key pinned from RELAY_API_KEY")
-            return self._pinned_api_key
-        row = self.db.query_one(
-            "SELECT value FROM settings WHERE key = ?", (_API_KEY_KEY,)
-        )
-        if row:
-            return row["value"]
-        key = _generate_api_key()
-        self.db.execute(
-            "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
-            (_API_KEY_KEY, key),
-        )
-        log.info("generated new proxy API key", extra={"data": {"masked": key[:9] + "…"}})
-        return key
-
     # -- accessors -------------------------------------------------------
     @property
     def current(self) -> RuntimeSettings:
         return self._settings
-
-    @property
-    def api_key(self) -> str:
-        return self._api_key
-
-    @property
-    def api_key_masked(self) -> str:
-        k = self._api_key
-        return k[:9] + "•" * 12 + k[-4:] if len(k) > 16 else "•" * len(k)
 
     def uptime_s(self) -> float:
         return time.time() - self.started_at
@@ -112,21 +69,3 @@ class SettingsStore:
             self._persist(self._settings)
             log.info("settings updated", extra={"data": changes})
         return self._settings
-
-    def regenerate_api_key(self) -> str:
-        if self._pinned_api_key:
-            # Allowed, but it only lasts until the next boot re-applies
-            # RELAY_API_KEY — say so rather than let it look permanent.
-            log.warning(
-                "regenerating a key that RELAY_API_KEY pins; the env value "
-                "will win again on restart")
-        self._api_key = _generate_api_key()
-        self.db.execute(
-            "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
-            (_API_KEY_KEY, self._api_key),
-        )
-        log.info(
-            "proxy API key regenerated",
-            extra={"data": {"masked": self.api_key_masked}},
-        )
-        return self._api_key

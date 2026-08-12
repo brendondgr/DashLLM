@@ -80,15 +80,13 @@ def test_settings_port_change_flags_restart(client):
     assert r.json()["restart_required"] is True
 
 
-def test_proxy_info_and_key_regen(client):
-    r = client.get("/admin/proxy")
-    info = r.json()
+def test_proxy_info_reports_no_key(client):
+    """relay takes no API key, so /admin/proxy must not invent one — a key
+    field here is what put "Authorization: Bearer" back into every snippet."""
+    info = client.get("/admin/proxy").json()
     assert info["base_url"].endswith("/v1")
-    assert info["api_key"].startswith("sk-relay-")
-    old = info["api_key"]
-    new = client.post("/admin/proxy/key").json()["api_key"]
-    assert new != old
-    assert client.get("/admin/proxy").json()["api_key"] == new
+    assert "api_key" not in info and "api_key_masked" not in info
+    assert client.post("/admin/proxy/key").status_code >= 400
 
 
 def test_frontend_log_ingestion(client):
@@ -102,17 +100,13 @@ def test_frontend_log_ingestion(client):
     assert {row["event"] for row in rows} == {"screen.switch", "api.fail"}
 
 
-def test_admin_token_enforced(cfg):
-    from fastapi.testclient import TestClient
-
-    from app.main import create_app
-
-    cfg2 = cfg.model_copy(update={"admin_token": "sekrit"})
-    app = create_app(cfg2)
-    with TestClient(app) as c:
-        assert c.get("/admin/settings").status_code == 401
-        ok = c.get("/admin/settings", headers={"X-Admin-Token": "sekrit"})
-        assert ok.status_code == 200
+def test_admin_plane_is_open(client):
+    """No auth layer: /admin answers without a token, and an X-Admin-Token
+    header is simply ignored rather than half-enforced."""
+    assert client.get("/admin/settings").status_code == 200
+    assert client.get(
+        "/admin/settings", headers={"X-Admin-Token": "anything"}
+    ).status_code == 200
 
 
 def test_protocol_and_available_models_round_trip(client):

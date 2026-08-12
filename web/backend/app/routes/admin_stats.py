@@ -2,11 +2,7 @@
 
 from fastapi import APIRouter, Depends, Query, Request
 
-from app.security import admin_guard
-
-router = APIRouter(
-    prefix="/admin/stats", tags=["stats"], dependencies=[Depends(admin_guard)]
-)
+router = APIRouter(prefix="/admin/stats", tags=["stats"])
 
 
 def _params(

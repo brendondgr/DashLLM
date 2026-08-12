@@ -4,16 +4,16 @@ import type { ProxyInfoOut } from '../../lib/types';
 import { C, MONO, SANS, card, sectionLabel } from '../../lib/styles';
 import { fmt, fmtUptime } from '../../lib/format';
 import { api } from '../../lib/api';
-import { log } from '../../lib/logger';
 import { usePoll } from '../../hooks/usePoll';
 
 type SnipTab = 'curl' | 'python' | 'node';
 
-function getSnippet(tab: SnipTab, baseUrl: string, keyShort: string): string {
+// relay takes no API key. The SDK snippets still pass one because the OpenAI
+// clients require the field to be non-empty — the value is ignored here.
+function getSnippet(tab: SnipTab, baseUrl: string): string {
   if (tab === 'curl') {
     return (
       `curl ${baseUrl}/chat/completions \\\n` +
-      `  -H "Authorization: Bearer ${keyShort}…" \\\n` +
       `  -H "Content-Type: application/json" \\\n` +
       `  -d '{\n` +
       `    "model": "auto",\n` +
@@ -27,7 +27,7 @@ function getSnippet(tab: SnipTab, baseUrl: string, keyShort: string): string {
       `from openai import OpenAI\n\n` +
       `client = OpenAI(\n` +
       `    base_url="${baseUrl}",\n` +
-      `    api_key="${keyShort}…",\n` +
+      `    api_key="unused",  # relay does not check it\n` +
       `)\n\n` +
       `resp = client.chat.completions.create(\n` +
       `    model="auto",  # routed to active endpoint\n` +
@@ -41,7 +41,7 @@ function getSnippet(tab: SnipTab, baseUrl: string, keyShort: string): string {
     `import OpenAI from "openai";\n\n` +
     `const client = new OpenAI({\n` +
     `  baseURL: "${baseUrl}",\n` +
-    `  apiKey: "${keyShort}…",\n` +
+    `  apiKey: "unused", // relay does not check it\n` +
     `});\n\n` +
     `const stream = await client.chat.completions.create({\n` +
     `  model: "auto",\n` +
@@ -63,19 +63,6 @@ const btnStyle: CSSProperties = {
   whiteSpace: 'nowrap',
 };
 
-const keyBoxStyle: CSSProperties = {
-  flex: 1,
-  background: C.bg,
-  border: `1px solid ${C.border}`,
-  borderRadius: 6,
-  padding: '9px 12px',
-  font: `400 12.5px ${MONO}`,
-  color: C.text,
-  overflow: 'hidden',
-  textOverflow: 'ellipsis',
-  whiteSpace: 'nowrap',
-};
-
 const urlBoxStyle: CSSProperties = {
   flex: 1,
   background: C.bg,
@@ -87,8 +74,6 @@ const urlBoxStyle: CSSProperties = {
 };
 
 export default function ProxyInfo(): React.JSX.Element {
-  const [keyShown, setKeyShown] = useState(false);
-  const [localKey, setLocalKey] = useState<string | null>(null);
   const [copied, setCopied] = useState<Record<string, boolean>>({});
   const [snipTab, setSnipTab] = useState<SnipTab>('curl');
 
@@ -100,24 +85,8 @@ export default function ProxyInfo(): React.JSX.Element {
     setTimeout(() => setCopied(prev => ({ ...prev, [k]: false })), 1600);
   }, []);
 
-  const handleRegenKey = useCallback(async () => {
-    try {
-      const res = await api.regenerateKey();
-      setLocalKey(res.api_key);
-      setKeyShown(true);
-      log.info('proxy.key.regenerate');
-    } catch { /* ignored */ }
-  }, []);
-
-  const apiKey = localKey ?? data?.api_key ?? '';
   const baseUrl = data?.base_url ?? '';
-
-  const apiKeyDisplay = keyShown
-    ? apiKey
-    : apiKey.slice(0, 9) + '••••••••••••••••';
-
-  const keyShort = apiKey.slice(0, 14);
-  const snippet = getSnippet(snipTab, baseUrl, keyShort);
+  const snippet = getSnippet(snipTab, baseUrl);
 
   const tabs: SnipTab[] = ['curl', 'python', 'node'];
 
@@ -129,55 +98,28 @@ export default function ProxyInfo(): React.JSX.Element {
 
   return (
     <div style={{ padding: '14px 18px 24px', display: 'flex', flexDirection: 'column', gap: 14, maxWidth: 860 }}>
-      {/* Row 1: 2-col grid */}
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 14 }}>
-        {/* Base URL card */}
-        <div style={{ ...card, padding: 16, display: 'flex', flexDirection: 'column', gap: 9 }}>
-          <span style={sectionLabel}>Base URL</span>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-            <span style={urlBoxStyle}>{baseUrl}</span>
-            <div
-              onClick={() => copyFeedback('url', baseUrl)}
-              style={btnStyle}
-            >
-              {copied['url'] ? '✓' : 'Copy'}
-            </div>
-          </div>
-          <span style={{ font: `400 11px ${SANS}`, color: C.textDim }}>
-            Drop-in replacement — set this as{' '}
-            <span style={{ fontFamily: MONO }}>base_url</span>{' '}
-            in any OpenAI client.
-          </span>
-        </div>
-
-        {/* API key card */}
-        <div style={{ ...card, padding: 16, display: 'flex', flexDirection: 'column', gap: 9 }}>
-          <span style={sectionLabel}>API key</span>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-            <span style={keyBoxStyle}>{apiKeyDisplay}</span>
-            <div
-              onClick={() => setKeyShown(v => !v)}
-              style={btnStyle}
-            >
-              {keyShown ? 'Hide' : 'Reveal'}
-            </div>
-            <div
-              onClick={() => copyFeedback('key', apiKey)}
-              style={btnStyle}
-            >
-              {copied['key'] ? '✓' : 'Copy'}
-            </div>
-          </div>
+      {/* Base URL */}
+      <div style={{ ...card, padding: 16, display: 'flex', flexDirection: 'column', gap: 9 }}>
+        <span style={sectionLabel}>Base URL</span>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <span style={urlBoxStyle}>{baseUrl}</span>
           <div
-            onClick={() => { void handleRegenKey(); }}
-            style={{ alignSelf: 'flex-start', font: `500 11px ${SANS}`, color: C.red, cursor: 'pointer', userSelect: 'none' }}
+            onClick={() => copyFeedback('url', baseUrl)}
+            style={btnStyle}
           >
-            ↻ Regenerate key
+            {copied['url'] ? '✓' : 'Copy'}
           </div>
         </div>
+        <span style={{ font: `400 11px ${SANS}`, color: C.textDim }}>
+          Drop-in replacement — set this as{' '}
+          <span style={{ fontFamily: MONO }}>base_url</span>{' '}
+          in any OpenAI client. No API key: send{' '}
+          <span style={{ fontFamily: MONO }}>model</span>{' '}
+          and go.
+        </span>
       </div>
 
-      {/* Row 2: snippet card */}
+      {/* Snippets */}
       <div style={{ ...card, padding: 16, display: 'flex', flexDirection: 'column', gap: 10 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
           {tabs.map(t => (
@@ -213,7 +155,7 @@ export default function ProxyInfo(): React.JSX.Element {
         </pre>
       </div>
 
-      {/* Row 3: 3-col stat cards */}
+      {/* Stat cards */}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 14 }}>
         {statCards.map(s => (
           <div key={s.label} style={{ ...card, padding: '14px 16px', display: 'flex', flexDirection: 'column', gap: 3 }}>
@@ -225,4 +167,3 @@ export default function ProxyInfo(): React.JSX.Element {
     </div>
   );
 }
-

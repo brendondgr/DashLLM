@@ -1,35 +1,15 @@
-"""Auth dependencies + secret redaction helpers.
+"""Client-key helpers for telemetry attribution.
 
-- Admin plane: ``X-Admin-Token`` enforced only when RELAY_ADMIN_TOKEN is set.
-- Client plane: Bearer key validated locally (never forwarded upstream);
-  only enforced when client auth is enabled by configuration.
+There is no auth plane. relay is an open OpenAI-compatible front door: no
+admin token, no client key, no accounts. What survives here is labeling —
+if a client happens to send ``Authorization: Bearer …`` (every OpenAI SDK
+does, because the field is not optional in most of them), the last four
+characters become the ``client_key`` column so the dashboard can tell two
+callers apart. The value is never validated, never stored in full, and never
+forwarded upstream.
 """
 
-import hmac
-
-from fastapi import HTTPException, Request
-
-from app.core.logging import get_logger
-
-log = get_logger("security")
-
-
-def mask_key(key: str | None) -> str | None:
-    if not key:
-        return None
-    return "…" + key[-4:] if len(key) >= 4 else "…"
-
-
-async def admin_guard(request: Request) -> None:
-    token = request.app.state.cfg.admin_token
-    if not token:
-        return
-    supplied = request.headers.get("x-admin-token", "")
-    if not hmac.compare_digest(supplied, token):
-        log.warning("admin auth rejected", extra={"data": {
-            "path": request.url.path,
-            "client": request.client.host if request.client else None}})
-        raise HTTPException(status_code=401, detail="invalid admin token")
+from fastapi import Request
 
 
 def extract_bearer(request: Request) -> str | None:
@@ -37,3 +17,10 @@ def extract_bearer(request: Request) -> str | None:
     if auth.lower().startswith("bearer "):
         return auth[7:].strip()
     return None
+
+
+def mask_key(key: str | None) -> str | None:
+    """A stable, non-reversible label for a caller. Never the key itself."""
+    if not key:
+        return None
+    return "…" + key[-4:] if len(key) >= 4 else "…"

@@ -2,7 +2,7 @@
 
 import time
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request
 
 from app.core.logging import get_logger
 from app.schemas import (
@@ -20,15 +20,12 @@ from app.schemas import (
     TunnelRouteTestResult,
     TunnelSessionStatus,
 )
-from app.security import admin_guard
 from app.services import ssh_config
 from app.services.tunnel_sessions import probe_route
 
 log = get_logger("admin")
 
-router = APIRouter(
-    prefix="/admin", tags=["endpoints"], dependencies=[Depends(admin_guard)]
-)
+router = APIRouter(prefix="/admin", tags=["endpoints"])
 
 
 async def _shares(request: Request) -> dict[str, float]:
