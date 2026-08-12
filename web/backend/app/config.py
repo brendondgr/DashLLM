@@ -10,11 +10,16 @@ from pathlib import Path
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 BACKEND_DIR = Path(__file__).resolve().parent.parent  # web/backend
+REPO_ROOT = BACKEND_DIR.parent.parent
+# The repo-root .env, not web/backend/.env: everything else (launch.sh, the
+# systemd wrappers) reads that one, and a plain `uvicorn app.main:app` run from
+# web/backend should pick up the same file rather than silently ignore it.
+ENV_FILE = REPO_ROOT / ".env"
 
 
 class Config(BaseSettings):
     model_config = SettingsConfigDict(
-        env_prefix="RELAY_", env_file=".env", extra="ignore"
+        env_prefix="RELAY_", env_file=ENV_FILE, extra="ignore"
     )
 
     # Reachable from the network by default: the point of this relay is to be
@@ -43,4 +48,62 @@ class Config(BaseSettings):
     frontend_dist: Path = BACKEND_DIR.parent / "frontend" / "dist"
 
 
+class OpenCodeConfig(BaseSettings):
+    """The OpenCode agent server relay registers for itself at boot.
+
+    Nothing here has to be set: the defaults describe an ``opencode serve`` on
+    this machine at :4096, and the Basic password is read from the credentials
+    file ``scripts/opencode-auth.sh`` mints on first launch. That file is the
+    only reason a clone-and-run works without touching a config.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="OPENCODE_", env_file=ENV_FILE, extra="ignore"
+    )
+
+    enabled: bool = True
+    host: str = "127.0.0.1"
+    port: int = 4096
+
+    endpoint_name: str = "opencode"
+    alias: str = "agent"  # what clients send as "model" to reach the agent
+
+    server_username: str = "opencode"
+    server_password: str = ""
+    auth_file: Path = BACKEND_DIR / "data" / "opencode-auth.env"
+
+    @property
+    def base_url(self) -> str:
+        return f"http://{self.host}:{self.port}"
+
+    def credential(self) -> str:
+        """``user:password`` for the adapter's HTTP Basic header, or "" when
+        no password is known. Environment wins over the generated file so a
+        hand-set OPENCODE_SERVER_PASSWORD is always what is presented."""
+        stored = _read_env_file(self.auth_file)
+        user = self.server_username or stored.get(
+            "OPENCODE_SERVER_USERNAME", "opencode")
+        password = self.server_password or stored.get(
+            "OPENCODE_SERVER_PASSWORD", "")
+        return f"{user}:{password}" if password else ""
+
+
+def _read_env_file(path: Path) -> dict[str, str]:
+    """Minimal KEY=value reader for the generated credentials file. Not a
+    dotenv parser — it only ever reads what opencode-auth.sh writes."""
+    out: dict[str, str] = {}
+    try:
+        text = path.read_text()
+    except OSError:
+        return out
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        out[key.strip()] = value.strip().strip("'\"")
+    return out
+
+
 config = Config()
+opencode_config = OpenCodeConfig()

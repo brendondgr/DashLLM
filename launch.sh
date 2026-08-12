@@ -1,29 +1,28 @@
 #!/usr/bin/env bash
-# launch.sh — bring up relay and an OpenCode agent server together, configured
-# entirely from .env, with the agent endpoint registered in relay automatically.
+# launch.sh — bring up relay and an OpenCode agent server together.
 #
-#   cp .env.example .env    # set OPENCODE_SERVER_PASSWORD at minimum
-#   ./launch.sh
+#   git clone … && cd DashLLM && ./launch.sh
 #
-#   ./launch.sh --list-models   # print the models your OpenCode server offers
-#                               # (for OPENCODE_MODELS) and exit
+# No configuration required. The Basic credentials `opencode serve` demands are
+# generated on first run and kept in web/backend/data/; relay registers the
+# agent endpoint itself and discovers the free models the server offers.
+#
 #   ./launch.sh --takeover      # stop the relay systemd service first
-#   ./launch.sh --env-file PATH # use a different config (default: ./.env)
+#   ./launch.sh --env-file PATH # load overrides from PATH (default: ./.env)
 #
-# Both processes run in the foreground as children of this script: Ctrl-C
-# stops both. For a boot-time setup use the systemd unit instead
-# (scripts/install-systemd.sh) — it reads the same .env.
+# Everything in .env is optional — see .env.example for the knobs. Both
+# processes run in the foreground as children of this script: Ctrl-C stops
+# both. For a boot-time setup use the systemd units instead
+# (scripts/install-systemd.sh) — they read the same files.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
 
-LIST_MODELS=0
 TAKEOVER=0
 ENV_FILE=".env"
 while [ $# -gt 0 ]; do
   case "$1" in
-    --list-models) LIST_MODELS=1 ;;
     --takeover) TAKEOVER=1 ;;
     --env-file) ENV_FILE="${2:?--env-file needs a path}"; shift ;;
     --env-file=*) ENV_FILE="${1#*=}" ;;
@@ -35,25 +34,22 @@ while [ $# -gt 0 ]; do
 done
 
 # ---- config -------------------------------------------------------------
-if [ ! -f "$ENV_FILE" ]; then
-  echo "no $ENV_FILE found. Start from the template:" >&2
-  echo "  cp .env.example .env" >&2
-  exit 1
+# .env is optional. set -a exports what it does define, so the values reach
+# both children: relay reads RELAY_*/OPENCODE_*, and `opencode serve` reads
+# OPENCODE_SERVER_* plus whatever provider key its providers look for.
+if [ -f "$ENV_FILE" ]; then
+  set -a
+  # shellcheck disable=SC1090
+  . "$ENV_FILE"
+  set +a
 fi
-# set -a exports everything sourced, so the values reach both child processes:
-# relay reads RELAY_*, and `opencode serve` reads OPENCODE_SERVER_* plus
-# whatever provider key its configured providers look for.
-set -a
-# shellcheck disable=SC1091
-. "$ENV_FILE"
-set +a
 
 RELAY_PORT="${RELAY_PORT:-4000}"
+RELAY_HOST="${RELAY_HOST:-0.0.0.0}"
 OPENCODE_ENABLED="${OPENCODE_ENABLED:-1}"
 OPENCODE_PORT="${OPENCODE_PORT:-4096}"
-OPENCODE_SERVER_USERNAME="${OPENCODE_SERVER_USERNAME:-opencode}"
 OPENCODE_PROJECT_DIR="${OPENCODE_PROJECT_DIR:-$ROOT}"
-export RELAY_PORT OPENCODE_PORT OPENCODE_SERVER_USERNAME
+export RELAY_PORT RELAY_HOST OPENCODE_PORT
 
 say() { printf '\033[1;33m▸\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31m✕\033[0m %s\n' "$*" >&2; exit 1; }
@@ -72,16 +68,15 @@ wait_for() { # wait_for <url> <label> [curl args...]
 # ---- preflight ----------------------------------------------------------
 if [ "$OPENCODE_ENABLED" = "1" ]; then
   command -v opencode >/dev/null || die "opencode is not on PATH (https://opencode.ai)"
-  [ -n "${OPENCODE_SERVER_PASSWORD:-}" ] || die \
-    "OPENCODE_SERVER_PASSWORD is empty in .env — without one, anyone who can
-   reach :$OPENCODE_PORT can run shell commands in $OPENCODE_PROJECT_DIR"
   [ -d "$OPENCODE_PROJECT_DIR" ] || die \
     "OPENCODE_PROJECT_DIR does not exist: $OPENCODE_PROJECT_DIR"
   port_busy "$OPENCODE_PORT" && die \
     "port $OPENCODE_PORT is already in use (OPENCODE_PORT)"
+  # shellcheck disable=SC1091
+  . "$ROOT/scripts/opencode-auth.sh"
 fi
 
-if [ "$LIST_MODELS" = "0" ] && port_busy "$RELAY_PORT"; then
+if port_busy "$RELAY_PORT"; then
   if [ "$TAKEOVER" = "1" ]; then
     say "stopping the relay service to free :$RELAY_PORT"
     systemctl --user stop relay.service 2>/dev/null || true
@@ -116,44 +111,43 @@ if [ "$OPENCODE_ENABLED" = "1" ]; then
   say "opencode healthy"
 fi
 
-if [ "$LIST_MODELS" = "1" ]; then
-  echo
-  echo "Models offered by this OpenCode server (for OPENCODE_MODELS in .env):"
-  # Delegated to the helper rather than an inline python -c: quoting a Python
-  # f-string inside a single-quoted bash string is a trap, and the helper
-  # already knows how to read .env and talk to the server.
-  python3 "$ROOT/scripts/register_opencode.py" --list-models
-  exit 0
-fi
-
-say "starting relay on :$RELAY_PORT"
+say "starting relay on $RELAY_HOST:$RELAY_PORT"
 (cd "$ROOT/web/backend" && exec uv run uvicorn app.main:app \
-  --host 127.0.0.1 --port "$RELAY_PORT") &
+  --host "$RELAY_HOST" --port "$RELAY_PORT") &
 pids+=("$!")
 wait_for "http://127.0.0.1:$RELAY_PORT/health" "relay"
 say "relay healthy"
 
-# ---- register the endpoint ----------------------------------------------
-if [ "$OPENCODE_ENABLED" = "1" ]; then
-  say "registering the agent endpoint"
-  python3 "$ROOT/scripts/register_opencode.py" \
-    || die "endpoint registration failed (relay is still running above)"
-fi
-
 # ---- summary ------------------------------------------------------------
-api_key=$(curl -fsS ${RELAY_ADMIN_TOKEN:+-H "X-Admin-Token: $RELAY_ADMIN_TOKEN"} \
-  "http://127.0.0.1:$RELAY_PORT/admin/proxy" 2>/dev/null \
-  | python3 -c 'import json,sys; print(json.load(sys.stdin)["api_key"])' 2>/dev/null || echo "?")
+# relay registers the agent endpoint at boot and then discovers its models in
+# the background, so give that a moment before printing what is routable.
+models=""
+for _ in $(seq 1 40); do
+  # No f-string here on purpose: escaping a quote inside one is a syntax error
+  # before Python 3.12, and this line already lives inside single quotes.
+  models=$(curl -fsS --max-time 3 "http://127.0.0.1:$RELAY_PORT/v1/models" \
+    2>/dev/null | python3 -c '
+import json, sys
+data = json.load(sys.stdin)["data"]
+print("\n".join("    " + m["id"] for m in data))' 2>/dev/null) || models=""
+  case "$models" in *"/"*) break ;; esac
+  sleep 0.5
+done
+[ -n "$models" ] || models="    (none yet — is opencode serve reachable?)"
 
+lan_ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{print $7; exit}')
 cat <<EOF
 
   dashboard   http://127.0.0.1:$RELAY_PORT
-  base_url    http://127.0.0.1:$RELAY_PORT/v1
-  api key     $api_key$([ "${RELAY_REQUIRE_CLIENT_KEY:-0}" = "1" ] || echo "   (not enforced — RELAY_REQUIRE_CLIENT_KEY=0)")
+  base_url    http://127.0.0.1:$RELAY_PORT/v1${lan_ip:+
+  from LAN    http://$lan_ip:$RELAY_PORT/v1}
+  auth        none — send a request, no key
+
+  routable models:
+$models
 
   try it:
     curl http://127.0.0.1:$RELAY_PORT/v1/chat/completions \\
-      -H "Authorization: Bearer $api_key" \\
       -H 'Content-Type: application/json' \\
       -d '{"model": "${OPENCODE_ALIAS:-agent}", "messages": [{"role": "user", "content": "hi"}]}'
 

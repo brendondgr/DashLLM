@@ -31,13 +31,11 @@ if [ "${OPENCODE_ENABLED:-1}" != "1" ]; then
   exit 0
 fi
 
-if [ -z "${OPENCODE_SERVER_PASSWORD:-}" ]; then
-  # Refuse rather than serve an unauthenticated agent: this process runs shell
-  # commands in OPENCODE_PROJECT_DIR for anyone who can reach the port.
-  echo "OPENCODE_SERVER_PASSWORD is empty in $ROOT/.env; refusing to start an" \
-       "unauthenticated agent server" >&2
-  exit 78  # EX_CONFIG
-fi
+# Load or mint the Basic credentials. Never served unauthenticated: this
+# process runs shell commands in OPENCODE_PROJECT_DIR for anyone who reaches
+# the port. relay reads the same file, so the two agree without configuration.
+# shellcheck disable=SC1091
+. "$ROOT/scripts/opencode-auth.sh"
 
 PROJECT_DIR="${OPENCODE_PROJECT_DIR:-$ROOT}"
 [ -d "$PROJECT_DIR" ] || { echo "OPENCODE_PROJECT_DIR does not exist: $PROJECT_DIR" >&2; exit 78; }

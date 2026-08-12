@@ -2,8 +2,9 @@
 
 Boot order: logging -> DB -> settings -> telemetry writer + live tracker ->
 (router registry, health prober, tunnel supervisor attach in later modules)
--> background housekeeping (live sampler, retention pruning). In production
-the built dashboard (web/frontend/dist) is served statically from "/".
+-> the OpenCode endpoint reconcile -> background housekeeping (live sampler,
+retention pruning). In production the built dashboard (web/frontend/dist) is
+served statically from "/".
 """
 
 import asyncio
@@ -13,7 +14,7 @@ import httpx
 from fastapi import FastAPI, Request, Response
 
 from app import __version__
-from app.config import Config, config
+from app.config import Config, OpenCodeConfig, config, opencode_config
 from app.core.logging import get_logger, setup_logging
 from app.db import Database
 from app.routes import (
@@ -24,6 +25,7 @@ from app.routes import (
     v1,
 )
 from app.services.health import HealthProber
+from app.services.opencode_boot import discover_models, ensure_endpoint
 from app.services.proxy import ProxyService
 from app.services.router import Router
 from app.services.settings_store import SettingsStore
@@ -76,6 +78,12 @@ async def lifespan(app: FastAPI):
     # Do NOT auto-connect tunnels on boot: interactive tunnels are connected
     # manually from the Endpoints UI, and legacy tunnels are opt-in.
     await app.state.tunnels.start_supervisor(autostart=False)
+    # Registered here rather than by a setup script: every way of starting
+    # relay should end up with the same agent endpoint (see opencode_boot).
+    agent_id = ensure_endpoint(app)
+    discovery = (asyncio.create_task(discover_models(app, agent_id),
+                                     name="opencode-discovery")
+                 if agent_id else None)
     task = asyncio.create_task(_housekeeping(app), name="housekeeping")
     log.info("relay started", extra={"data": {
         "version": __version__, "port": app.state.cfg.port,
@@ -96,6 +104,8 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         task.cancel()
+        if discovery:
+            discovery.cancel()
         await app.state.tunnel_sessions.shutdown()
         await app.state.tunnels.stop_supervisor()
         await app.state.prober.stop()
@@ -105,12 +115,14 @@ async def lifespan(app: FastAPI):
         log.info("relay stopped")
 
 
-def create_app(cfg: Config | None = None) -> FastAPI:
+def create_app(cfg: Config | None = None,
+               oc_cfg: OpenCodeConfig | None = None) -> FastAPI:
     cfg = cfg or config
     setup_logging(cfg.log_dir, cfg.log_level)
 
     app = FastAPI(title="relay", version=__version__, lifespan=lifespan)
     app.state.cfg = cfg
+    app.state.opencode = oc_cfg or opencode_config
     app.state.db = Database(cfg.db_path)
     app.state.settings = SettingsStore(app.state.db, boot_port=cfg.port)
     app.state.telemetry = TelemetryWriter(app.state.db)

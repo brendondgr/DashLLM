@@ -30,6 +30,14 @@ Operational note: an OpenCode instance behind relay must have its
 ``permission`` config set explicitly. A permission set to ``"ask"`` parks the
 turn forever — there is no human on this side to answer it — which is what
 ``_TURN_TIMEOUT`` exists to bound.
+
+**Only free models are served.** relay has no auth layer, so anyone who can
+reach the port can spend whatever the OpenCode account is authenticated for.
+The one thing standing between an open port and a real bill is this filter:
+a model is usable only if its id contains ``free`` (see ``is_free_model``).
+It is enforced twice on purpose — the probe never publishes a paid model, and
+``forward`` refuses one even if a paid id was written into an endpoint's
+allowlist by hand.
 """
 
 import asyncio
@@ -127,11 +135,26 @@ def flatten_messages(messages: list[dict]) -> tuple[str, str | None]:
     return prompt, ("\n\n".join(system) or None)
 
 
-def catalog_models(payload: dict) -> list[str]:
-    """``GET /config/providers`` -> ``["anthropic/claude-sonnet-4-5", ...]``.
+def is_free_model(model: str | None) -> bool:
+    """Free models are the ones whose id says so — ``opencode/hy3-free``,
+    ``opencode/nemotron-3-ultra-free``. That naming convention is the whole
+    rule; the provider half of the id is ignored so a provider called "free"
+    can't wave a paid model through.
+
+    Change this function and you change what an open relay can be billed for.
+    """
+    if not model:
+        return False
+    return "free" in model.rpartition("/")[2].lower()
+
+
+def catalog_models(payload: dict, free_only: bool = True) -> list[str]:
+    """``GET /config/providers`` -> ``["opencode/hy3-free", ...]``.
 
     ``providers[].models`` is a map keyed by model id in the current server;
     a list is accepted too so a shape change doesn't blank the catalog.
+    Paid models are dropped here rather than at the door, so they never reach
+    the router, ``/v1/models``, or the dashboard in the first place.
     """
     out: list[str] = []
     for provider in payload.get("providers") or []:
@@ -150,8 +173,12 @@ def catalog_models(payload: dict) -> list[str]:
             ids = []
         out.extend(f"{pid}/{mid}" for mid in ids if mid)
 
+    if free_only:
+        out = [m for m in out if is_free_model(m)]
+
     # Surface the server's configured default first: relay treats models[0] as
-    # the endpoint's default model.
+    # the endpoint's default model. A paid default (OpenCode's usually is) has
+    # already been filtered out, in which case the first free model wins.
     default = payload.get("default")
     if isinstance(default, dict):
         for pid, mid in default.items():
@@ -262,6 +289,50 @@ class OpenCodeAdapter(UpstreamAdapter):
                 ok=False, latency_ms=round(latency, 1),
                 error=f"{type(e).__name__}: {e}")
 
+    # ---- model policy ----------------------------------------------------
+    def _pick_model(self, proxy, endpoint: dict,
+                    requested: str | None) -> tuple[str | None, str | None]:
+        """Resolve the turn's model, or refuse. Returns (model, refusal).
+
+        Two cases, and the second is the one that matters:
+
+        - The caller named a concrete ``provider/model``. Serve it if it is
+          free, refuse it otherwise — including when it arrived via an
+          endpoint's ``model_override``, which the dashboard can set by hand.
+        - The caller used the alias (no provider prefix). Substituting the
+          endpoint's first free model is not a nicety: omitting ``model`` from
+          the message lets *OpenCode* choose, and its configured default is
+          normally a paid one.
+        """
+        st = proxy.router.state.get(endpoint["id"])
+        free = [m for m in (st.models if st else []) if is_free_model(m)]
+
+        if requested and split_model(requested):
+            if is_free_model(requested):
+                return requested, None
+            return None, (
+                f"model {requested!r} is not available: this relay serves only"
+                " free models"
+                + (f" ({', '.join(free)})" if free else "")
+                + ". See GET /v1/models.")
+
+        if free:
+            return free[0], None
+        return None, (
+            "no free model is available from this OpenCode server — none of"
+            " the models it offers have 'free' in the id, or the provider"
+            " catalog has not been read yet")
+
+    def _reject(self, proxy, record: RequestRecord, t0: float, message: str,
+                short: str | None = None) -> JSONResponse:
+        record.status = 400
+        record.ok = False
+        record.error = short or message
+        record.latency_ms = (time.perf_counter() - t0) * 1000
+        proxy.telemetry.submit(record)
+        return JSONResponse(status_code=400, content={"error": {
+            "message": message, "type": "relay_proxy_error", "code": 400}})
+
     # ---- forwarding -----------------------------------------------------
     async def forward(self, proxy, request: Request, endpoint: dict, path: str,
                       record: RequestRecord, body: bytes,
@@ -275,18 +346,18 @@ class OpenCodeAdapter(UpstreamAdapter):
 
         prompt, system = flatten_messages(payload.get("messages") or [])
         if not prompt:
-            record.status = 400
-            record.ok = False
-            record.error = "no user message to send to the agent"
-            record.latency_ms = (time.perf_counter() - t0) * 1000
-            proxy.telemetry.submit(record)
-            return JSONResponse(status_code=400, content={"error": {
-                "message": "chat request has no user message content",
-                "type": "relay_proxy_error", "code": 400}})
+            return self._reject(
+                proxy, record, t0,
+                "chat request has no user message content",
+                short="no user message to send to the agent")
 
         # record.model was resolved upstream of here (an allowlisted model the
         # client asked for, else model_override, else the discovered default).
-        model = payload.get("model") or record.model
+        model, refusal = self._pick_model(
+            proxy, endpoint, payload.get("model") or record.model)
+        if refusal:
+            return self._reject(proxy, record, t0, refusal)
+        record.model = model
         turn = {
             "prompt": prompt,
             "system": system,
@@ -397,7 +468,8 @@ class OpenCodeAdapter(UpstreamAdapter):
             raise RetryableUpstreamError(
                 f"agent returned an empty turn for model {record.model!r} — "
                 "that model id is probably not served by this OpenCode "
-                "instance (check ./launch.sh --list-models)", status=502)
+                "instance (GET /v1/models lists the ones that are)",
+                status=502)
 
         return self._to_completion(data, record)
 

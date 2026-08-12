@@ -58,9 +58,18 @@ class HealthProber:
             await asyncio.gather(*(self._probe(eid) for eid in ids))
 
     async def _probe(self, eid: str) -> None:
+        await self.probe_and_report(eid)
+
+    async def probe_and_report(self, eid: str):
+        """One probe, fed into the health state machine and model discovery.
+
+        The sweep uses this, and so does boot-time OpenCode discovery — a
+        probe that quietly skipped the state machine would leave a freshly
+        registered endpoint reading "unknown" no matter how it answered.
+        """
         result = await self.probe_endpoint(eid)
         if result is None:
-            return
+            return None
         if result.ok:
             self.router.report_success(
                 eid, latency_ms=result.latency_ms, source="probe")
@@ -69,6 +78,7 @@ class HealthProber:
         else:
             self.router.report_failure(
                 eid, result.error or "probe failed", source="probe")
+        return result
 
     async def probe_endpoint(self, eid: str) -> EndpointTestResult | None:
         """One live probe; also the handler for POST /admin/endpoints/{id}/test."""

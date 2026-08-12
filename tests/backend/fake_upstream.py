@@ -123,14 +123,18 @@ def make_opencode_upstream() -> tuple[FastAPI, dict]:
     async def providers(request: Request):
         calls["providers"] += 1
         calls["auth"] = request.headers.get("authorization")
+        # Shaped like a real OpenCode Zen catalog: mostly paid, a couple of
+        # models with "free" in the id, and a *paid* server default. relay
+        # serves only the free ones, so the filter has something to bite on.
         return {
             "providers": [{
-                "id": "anthropic", "name": "Anthropic",
-                "models": {"claude-sonnet-4-5": {}, "claude-haiku-4-5": {}},
+                "id": "opencode", "name": "OpenCode Zen",
+                "models": {"claude-opus-5": {}, "hy3-free": {},
+                           "mimo-v2.5-free": {}},
             }, {
                 "id": "openai", "name": "OpenAI", "models": {"gpt-5": {}},
             }],
-            "default": {"anthropic": "claude-sonnet-4-5"},
+            "default": {"opencode": "claude-opus-5"},
         }
 
     @up.post("/session")
@@ -156,8 +160,8 @@ def make_opencode_upstream() -> tuple[FastAPI, dict]:
         return {
             "info": {
                 "id": "msg_1", "role": "assistant", "sessionID": sid,
-                "providerID": model.get("providerID", "anthropic"),
-                "modelID": model.get("modelID", "claude-sonnet-4-5"),
+                "providerID": model.get("providerID", "opencode"),
+                "modelID": model.get("modelID", "hy3-free"),
                 "cost": 0.00123,
                 "finish": "stop",
                 "tokens": {"total": 17, "input": 11, "output": 4,

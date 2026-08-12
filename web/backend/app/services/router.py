@@ -556,6 +556,41 @@ class Router:
         st.discovered = models
         self._apply_allowlist(eid)
 
+    def sync_allowlist(self, eid: str, models: list[str]) -> bool:
+        """Publish a discovered model list as the endpoint's allowlist.
+
+        For an alias-only protocol like OpenCode, ``available_models`` is not
+        a restriction so much as the *addressable* list: a model that isn't in
+        it cannot be named in a request at all (see ``resolve_request_model``)
+        and never appears in ``/v1/models``. Discovery and addressability have
+        to be the same set, or the models the dashboard shows as available are
+        ones nobody can actually call.
+
+        Called from the boot reconcile only, never from the probe loop — an
+        allowlist narrowed by hand in the dashboard should survive until the
+        next restart rather than be overwritten fifteen seconds later.
+        """
+        row = self.endpoints.get(eid)
+        if row is None:
+            return False
+        current = self.available_models(eid)
+        if [m.lower() for m in current] == [m.lower() for m in models]:
+            return False
+        try:
+            validated = self._validate_models(models, exclude_id=eid)
+        except ValueError as e:
+            log.warning("could not publish discovered models", extra={"data": {
+                "endpoint": row["name"], "error": str(e)}})
+            return False
+        row["available_models"] = _models_json(validated)
+        self.db.execute(
+            "UPDATE endpoints SET available_models = ? WHERE id = ?",
+            (row["available_models"], eid))
+        self._apply_allowlist(eid)
+        log.info("published discovered models", extra={"data": {
+            "endpoint": row["name"], "models": validated}})
+        return True
+
     def _apply_allowlist(self, eid: str) -> None:
         st = self.state[eid]
         allowed = self.available_models(eid)
