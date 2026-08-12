@@ -23,8 +23,8 @@ index.astro → Base.astro (fonts, global CSS, keyframes, hover classes)
     │                           `protocol` from the type select
     ├── screens/SshTunnel.tsx   structured tunnel form, generated command,
     │                           PTY session panel, test log, active tunnels
-    ├── screens/ProxyInfo.tsx   base URL, API key reveal/copy/regenerate,
-    │                           curl/python/node snippets, proxy stat cards
+    ├── screens/ProxyInfo.tsx   base URL, curl/python/node snippets,
+    │                           proxy stat cards (no key: there isn't one)
     ├── screens/Settings.tsx    toggles, proxy port, retention slider
     └── EChart.tsx              generic ECharts host (init once, setOption,
                                 ResizeObserver, dispose on unmount)

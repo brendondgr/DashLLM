@@ -51,7 +51,7 @@ failover may land on an endpoint running a different model.
                         ┌─────────────────────────────────────────────┐
   OpenAI SDK / curl ──▶ │  /v1/chat/completions  /v1/embeddings  ...  │
                         │                 PROXY LAYER                 │
-                        │   • optional client-key auth                │
+                        │   • no auth: open front door                │
                         │   • resolve target via ROUTER (live state)  │
                         │   • rewrite model (alias / auto / override)  │
                         │   • stream tee: capture TTFT + usage        │
@@ -81,10 +81,11 @@ failover may land on an endpoint running a different model.
 | Subsystem | Module | Notes |
 | --- | --- | --- |
 | App wiring / lifespan | `app/main.py` | boots telemetry writer, health prober, tunnel supervisor, housekeeping; dynamic CORS middleware; serves frontend dist |
-| Config | `app/config.py` | pydantic-settings, `RELAY_*` env vars; boot-time values only |
-| Runtime settings | `app/services/settings_store.py` | DB-backed mutable toggles + the client API key |
+| Config | `app/config.py` | pydantic-settings; `RELAY_*` and `OPENCODE_*` env vars, repo-root `.env`; boot-time values only |
+| Runtime settings | `app/services/settings_store.py` | DB-backed mutable toggles |
 | Logging | `app/core/logging.py` | rotating file + console, JSON lines |
-| Auth | `app/security.py` | `admin_guard` dependency, bearer extraction, key masking |
+| Client labeling | `app/security.py` | bearer extraction + masking for telemetry attribution. No auth plane — nothing here rejects a request |
+| OpenCode bootstrap | `app/services/opencode_boot.py` | upserts the agent endpoint at boot, then discovers and publishes its free models |
 | Storage | `app/db.py` | SQLite (WAL), additive column migrations, one-time rollup backfill |
 | Proxy | `app/services/proxy.py` + `app/routes/v1.py` | streaming tee, TTFT, usage capture, pre-first-byte retry, stale-override self-heal |
 | Protocol adapters | `app/services/adapters/` | per-`protocol` probe + forward; `passthrough` (OpenAI) and `opencode` (agent sessions) |

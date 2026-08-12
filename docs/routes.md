@@ -15,8 +15,8 @@ Proxy Info, Settings.
 ## Backend — OpenAI-compatible client plane
 
 `app/routes/v1.py` registers a **single catch-all**
-(`ANY /v1/{path:path}`, methods GET/POST/PUT/DELETE/PATCH/HEAD) that enforces
-optional client-key auth and hands off to the proxy service. The proxy
+(`ANY /v1/{path:path}`, methods GET/POST/PUT/DELETE/PATCH/HEAD) that hands off
+to the proxy service. There is no authentication on it. The proxy
 classifies the path itself, so these are behaviors rather than separate route
 declarations:
 
@@ -30,7 +30,8 @@ declarations:
 
 ## Backend — control plane
 
-All `/admin/*` routes carry the `admin_guard` dependency.
+No `/admin/*` route is authenticated — there is no admin plane. See
+[api-contract.md](api-contract.md#auth).
 
 ### Endpoints — `app/routes/admin_endpoints.py`
 
@@ -92,8 +93,7 @@ All `/admin/*` routes carry the `admin_guard` dependency.
 | Method | Path | Notes |
 | --- | --- | --- |
 | GET/PUT | `/admin/settings` | toggles, retention, proxy port |
-| GET | `/admin/proxy` | base url, API key + masked form, uptime, totals, DB size |
-| POST | `/admin/proxy/key` | regenerate the client API key |
+| GET | `/admin/proxy` | base url (built from the request's Host header), uptime, totals, DB size |
 | POST | `/admin/logs/frontend` | frontend UI event ingestion (≤200 per batch) |
 | GET | `/admin/logs/frontend?limit=100` | read back recent UI events |
 

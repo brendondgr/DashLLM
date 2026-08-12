@@ -127,3 +127,19 @@ def test_alias_is_configurable(opencode_env, tmp_path, alias):
     _configure(app, tmp_path, alias=alias)
     eid = ensure_endpoint(app)
     assert app.state.router.endpoints[eid]["alias"] == alias
+
+
+def test_proxy_snippets_get_a_model_that_actually_routes(opencode_env, tmp_path):
+    """`auto` resolves only to OpenAI-protocol endpoints, so on an agent-only
+    relay the dashboard's copy-paste snippets must not offer it."""
+    client, app, calls = opencode_env
+    _configure(app, tmp_path)
+    ensure_endpoint(app)
+
+    assert client.get("/admin/proxy").json()["example_model"] == "agent"
+
+    # ...but an OpenAI endpoint in the pool makes "auto" the right suggestion
+    client.post("/admin/endpoints", json={
+        "name": "box", "base_url": "http://good/v1", "protocol": "openai",
+        "server_type": "llama.cpp"})
+    assert client.get("/admin/proxy").json()["example_model"] == "auto"

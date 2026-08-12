@@ -133,6 +133,7 @@ export interface RuntimeSettings {
 export interface ProxyInfoOut {
   base_url: string;
   port: number;
+  example_model: string;
   uptime_s: number;
   requests_total: number;
   active_clients: number;

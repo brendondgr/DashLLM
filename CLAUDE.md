@@ -77,6 +77,31 @@ backend changes and `npm run build` + `relay restart` picks up frontend ones.
 
 ## Things that will bite you
 
+- **There is no auth, anywhere, on purpose.** No API key on `/v1`, no token on
+  `/admin`, no accounts. A previous pass added an admin/user two-plane login
+  and it was reverted wholesale — don't reintroduce a guard, a key, or a
+  session because a route "looks sensitive". What bounds an open relay is the
+  model policy below. `app/security.py` is telemetry labeling only; nothing in
+  it rejects a request.
+- **Only free OpenCode models are servable.** `is_free_model` in
+  `adapters/opencode.py` — id contains `free` — enforced at discovery *and* in
+  `forward()`. Both call sites are load-bearing: the first keeps paid models
+  out of `/v1/models` and the router, the second catches a paid id typed into
+  an allowlist or set as a `model_override`. An alias request must always
+  resolve to a concrete free model, because omitting `model` from an OpenCode
+  message body lets the server pick and its default is paid.
+- **The OpenCode endpoint is owned by boot, not by the dashboard.**
+  `services/opencode_boot.py` upserts it from `OpenCodeConfig` on every start
+  and republishes its model list after discovery, so edits to *that* endpoint
+  last until the next restart. It is in-process precisely so launch.sh,
+  systemd, and a bare uvicorn behave identically — don't move it back into a
+  setup script.
+- **`Router.sync_allowlist` is called from the boot reconcile only.** From the
+  probe loop it would overwrite an operator's narrowed allowlist fifteen
+  seconds after they set it.
+- **Shell helpers sourced under `set -euo pipefail` must not SIGPIPE.**
+  `tr -dc … < /dev/urandom | head -c 32` exits 141 and killed `launch.sh`
+  before it printed a single line. Bound the read at the source instead.
 - **The API contract is written three times.** `app/schemas/__init__.py`,
   `web/frontend/src/lib/types.ts`, and `docs/api-contract.md`. Change one,
   change all three.
@@ -118,7 +143,7 @@ backend changes and `npm run build` + `relay restart` picks up frontend ones.
 
 ## Testing
 
-136 tests in `tests/backend/`, all against fake upstream ASGI apps
+149 tests in `tests/backend/`, all against fake upstream ASGI apps
 (`fake_upstream.py`, routed by hostname: `good` / `strict` / `opencode` /
 `flaky` / dead) — no real model server, agent server, or SSH host required.
 Tunnel lifecycle is tested with an injectable fake command, since real SSH
@@ -138,9 +163,9 @@ handed to the HTTP client — see `adapters/opencode.py`.
 - **`dataviz`** — before adding or restyling any chart. The dashboard already
   has a committed palette in `src/lib/styles.ts`; use that skill's method to
   keep new charts consistent with it, not to replace the palette.
-- **`security-review`** — before changing `app/security.py`,
-  `tunnel_sessions.py`, or `tunnels.py`. Those handle auth, key injection, and
-  subprocess argv construction.
+- **`security-review`** — before changing the model policy in
+  `adapters/opencode.py`, or `tunnel_sessions.py` / `tunnels.py`. Those bound
+  what an unauthenticated relay can spend and do, and build subprocess argv.
 - **`simplify`** — after a large change, for reuse/altitude cleanups.
 - **`/code-review`** — for correctness review of a working diff.
 

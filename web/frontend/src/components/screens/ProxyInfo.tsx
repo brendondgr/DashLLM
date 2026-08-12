@@ -10,13 +10,13 @@ type SnipTab = 'curl' | 'python' | 'node';
 
 // relay takes no API key. The SDK snippets still pass one because the OpenAI
 // clients require the field to be non-empty — the value is ignored here.
-function getSnippet(tab: SnipTab, baseUrl: string): string {
+function getSnippet(tab: SnipTab, baseUrl: string, model: string): string {
   if (tab === 'curl') {
     return (
       `curl ${baseUrl}/chat/completions \\\n` +
       `  -H "Content-Type: application/json" \\\n` +
       `  -d '{\n` +
-      `    "model": "auto",\n` +
+      `    "model": "${model}",\n` +
       `    "stream": true,\n` +
       `    "messages": [{"role": "user", "content": "Hello"}]\n` +
       `  }'`
@@ -30,7 +30,7 @@ function getSnippet(tab: SnipTab, baseUrl: string): string {
       `    api_key="unused",  # relay does not check it\n` +
       `)\n\n` +
       `resp = client.chat.completions.create(\n` +
-      `    model="auto",  # routed to active endpoint\n` +
+      `    model="${model}",\n` +
       `    messages=[{"role": "user", "content": "Hello"}],\n` +
       `    stream=True,\n` +
       `)`
@@ -44,7 +44,7 @@ function getSnippet(tab: SnipTab, baseUrl: string): string {
     `  apiKey: "unused", // relay does not check it\n` +
     `});\n\n` +
     `const stream = await client.chat.completions.create({\n` +
-    `  model: "auto",\n` +
+    `  model: "${model}",\n` +
     `  messages: [{ role: "user", content: "Hello" }],\n` +
     `  stream: true,\n` +
     `});`
@@ -86,7 +86,7 @@ export default function ProxyInfo(): React.JSX.Element {
   }, []);
 
   const baseUrl = data?.base_url ?? '';
-  const snippet = getSnippet(snipTab, baseUrl);
+  const snippet = getSnippet(snipTab, baseUrl, data?.example_model ?? 'auto');
 
   const tabs: SnipTab[] = ['curl', 'python', 'node'];
 

@@ -29,6 +29,17 @@ check "GET /admin/stats/by-endpoint" json "/admin/stats/by-endpoint?window=24h"
 check "GET /admin/stats/live" json /admin/stats/live
 check "dashboard served at /" curl -sf -m 5 "$BASE/"
 
+# `auto` resolves only to OpenAI-protocol endpoints — an agent server is
+# alias-only by design. On an OpenCode-only relay (the default clone-and-run
+# shape) the auto checks have nothing to route to, so skip rather than fail.
+HAS_OPENAI=$(json /v1/models | python3 -c '
+import json, sys
+data = json.load(sys.stdin)["data"]
+print(any(m.get("relay", {}).get("protocol") == "openai" for m in data))' 2>/dev/null)
+
+if [ "$HAS_OPENAI" != "True" ]; then
+  echo "skip | model=auto checks (no OpenAI-protocol endpoint registered)"
+else
 echo "== proxied completion (model=auto, non-stream) =="
 RESP=$(curl -sf -m 120 "$BASE/v1/chat/completions" \
   -H 'Content-Type: application/json' \
@@ -51,7 +62,9 @@ else
   FAILURES=$((FAILURES + 1))
 fi
 
-echo "== alias routing (every advertised alias) =="
+fi
+
+echo "== alias routing (every advertised model) =="
 ALIASES=$(json /v1/models | python3 -c '
 import json, sys
 for m in json.load(sys.stdin)["data"]:

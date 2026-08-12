@@ -55,10 +55,10 @@ if [ "$START" -eq 1 ]; then
   fuser -k 4000/tcp 2>/dev/null || true
   sleep 1
   systemctl --user enable --now relay.service
-  # A missing/blank OPENCODE_SERVER_PASSWORD makes the wrapper exit 78 by
-  # design; that is a configuration message, not an install failure.
+  # The wrapper mints its own Basic credentials, so this needs no config; it
+  # still exits 0 without starting when OPENCODE_ENABLED=0.
   systemctl --user enable --now opencode.service || echo \
-    "opencode.service did not start — check .env (journalctl --user -u opencode.service)"
+    "opencode.service did not start (journalctl --user -u opencode.service)"
 else
   systemctl --user enable relay.service opencode.service
 fi

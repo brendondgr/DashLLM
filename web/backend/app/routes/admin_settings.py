@@ -35,6 +35,25 @@ def _db_size_bytes(db_path) -> int:
     return total
 
 
+def _example_model(router) -> str:
+    """A model id the copy-paste snippets can actually use.
+
+    "auto" only resolves to an OpenAI-protocol endpoint, so on an
+    OpenCode-only relay — the default clone-and-run shape — a snippet built
+    around it hands the reader a 503. Fall back to the first routable alias.
+    """
+    enabled = [r for r in router.endpoints.values() if r["enabled"]]
+    if any((r.get("protocol") or "openai") == "openai" for r in enabled):
+        return "auto"
+    for row in enabled:
+        if row.get("alias"):
+            return row["alias"]
+        models = router.available_models(row["id"])
+        if models:
+            return models[0]
+    return "auto"
+
+
 @router.get("/proxy")
 async def proxy_info(request: Request):
     st = request.app.state.settings
@@ -50,6 +69,7 @@ async def proxy_info(request: Request):
     return {
         "base_url": f"{origin}/v1",
         "port": st.current.proxy_port,
+        "example_model": _example_model(request.app.state.router),
         "uptime_s": round(st.uptime_s(), 1),
         "requests_total": (row["n"] if row else 0) + len(live.in_flight),
         "active_clients": live.active_clients(),

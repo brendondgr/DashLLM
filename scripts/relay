@@ -71,38 +71,25 @@ relay_port() {
 }
 PORT="$(relay_port)"
 
-# Re-apply .env to relay's endpoint registry. Best effort: a failure here means
-# the endpoint is stale, not that relay is down, so it must not fail the verb.
-register_endpoint() {
-  oc_active || return 0
-  [ -f "$REPO/.env" ] || return 0
-  [ -f "$REPO/scripts/register_opencode.py" ] || return 0
+# Wait for relay (and the agent server) to answer before a verb prints health.
+# Best effort: a slow boot is not a failed start.
+wait_ready() {
   for _ in $(seq 1 40); do
     curl -fsS --max-time 2 "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1 && break
     sleep 0.5
   done
-  # Wait for the agent server too, not just relay: registering while opencode
-  # is still booting records the endpoint as `degraded` on the create-time
-  # probe. It self-heals on the next 15s sweep, but "degraded" is a poor first
-  # thing to print after a successful start.
-  local oc_port oc_user oc_pass
-  oc_port=$(. "$REPO/.env" >/dev/null 2>&1; echo "${OPENCODE_PORT:-4096}")
-  oc_user=$(. "$REPO/.env" >/dev/null 2>&1; echo "${OPENCODE_SERVER_USERNAME:-opencode}")
-  oc_pass=$(. "$REPO/.env" >/dev/null 2>&1; echo "${OPENCODE_SERVER_PASSWORD:-}")
-  for _ in $(seq 1 40); do
-    curl -fsS --max-time 2 -u "${oc_user}:${oc_pass}" \
-      "http://127.0.0.1:${oc_port}/global/health" >/dev/null 2>&1 && break
-    sleep 0.5
-  done
-  ( set -a; . "$REPO/.env"; set +a
-    python3 "$REPO/scripts/register_opencode.py" ) 2>&1 | sed 's/^/  /' || true
+  oc_active || return 0
+  # relay registers the agent endpoint itself at boot and then probes it, so
+  # there is nothing to re-apply here — just give that a moment so `relay
+  # status` right after a start does not report "unknown".
+  sleep 1
 }
 
 case "${1:-status}" in
   start)
     # shellcheck disable=SC2046
     systemctl --user start $(units) && echo "started: $(units)"
-    register_endpoint
+    wait_ready
     ;;
   stop)
     # shellcheck disable=SC2046
@@ -111,7 +98,7 @@ case "${1:-status}" in
   restart)
     # shellcheck disable=SC2046
     systemctl --user restart $(units) && echo "restarted: $(units)"
-    register_endpoint
+    wait_ready
     ;;
   status)
     for u in $(units); do

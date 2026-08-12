@@ -217,26 +217,31 @@ Percentiles in `summary` are exact (computed from raw rows) for spans up to
   endpoint_latency_ms, models[], error}`.
 - `GET /admin/tunnels/{id}/command` → `{command: "ssh -N -C -L 8443:127.0.0.1:8000 -p 22 -i ~/.ssh/id_ed25519 -o … user@host"}`.
   Cosmetic rendering of the argv list that is actually executed.
-- `GET /admin/proxy` → `{base_url, port, api_key, api_key_masked, uptime_s,
-  requests_total, active_clients, db_size_bytes}`. `db_size_bytes` sums the
-  main DB plus its `-wal` and `-shm` files.
-- `POST /admin/proxy/key` → `{api_key, api_key_masked}` (regenerates).
+- `GET /admin/proxy` → `{base_url, port, example_model, uptime_s,
+  requests_total, active_clients, db_size_bytes}`. `base_url` is built from the
+  request's `Host` header, so it is copy-pasteable from whatever machine loaded
+  the dashboard. `example_model` is a model id the dashboard's snippets can
+  actually call: `auto` when an OpenAI-protocol endpoint is registered,
+  otherwise the first routable alias (`auto` resolves to nothing on an
+  agent-only relay). `db_size_bytes` sums the main DB plus its `-wal` and `-shm`
+  files. There is no key field — see Auth.
 - `POST /admin/logs/frontend` accepts `{events:[{ts, level, event, detail?}]}`
   (max 200 per batch) → `{accepted: n}`.
 - `GET /admin/logs/frontend?limit=100` → recent ingested UI events.
 
 ## Auth
 
-- **Client plane `/v1/*`** — `Authorization: Bearer <client key>`, enforced
-  only when `RELAY_REQUIRE_CLIENT_KEY` is true. The caller's key is validated
-  locally against the stored proxy key and **never forwarded**; the target
-  endpoint's own key is injected instead. `Authorization` is in the
-  hop-by-hop strip list, so it cannot leak upstream even when auth is off.
+**There is none.** `/v1/*` and `/admin/*` both answer any caller that can
+reach the port. No API key, no admin token, no accounts, no sessions.
 
-  The proxy key is generated on first boot and persisted. Set `RELAY_API_KEY`
-  to pin a known value instead — it wins over the stored one at every boot, so
-  a key baked into client configs keeps matching. Regenerating from the
-  dashboard still works but only holds until the next restart, and logs a
-  warning saying so.
-- **Admin plane `/admin/*`** — `X-Admin-Token` header, enforced only when
-  `RELAY_ADMIN_TOKEN` is set. Compared with `hmac.compare_digest`.
+- A caller may still send `Authorization: Bearer …` — most OpenAI SDKs make
+  the field mandatory — and relay keeps the last four characters as the
+  `client_key` label on the telemetry row. It is not validated against
+  anything, and `Authorization` is in the hop-by-hop strip list, so it is
+  never forwarded upstream. The target endpoint's own `upstream_key` is
+  injected instead.
+- The only thing bounding an open relay is the model policy: an OpenCode
+  endpoint serves models with `free` in the id and refuses the rest
+  (`adapters/opencode.py::is_free_model`). That caps spend. It does **not**
+  cap what an agent turn can do on the host it runs on — see
+  [deployment.md](deployment.md).

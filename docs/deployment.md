@@ -29,18 +29,16 @@ same paths work in dev and production.
 
 Boot-time only — these are read before the DB opens. Runtime-mutable settings
 (toggles, retention, proxy port) live in the DB and are edited from the
-Settings screen. An `.env` file in `web/backend/` is also read.
+Settings screen. All of them are optional; the repo-root `.env` is read if it
+exists (`app/config.py` points at it explicitly), and so is the environment.
 
 | Var | Default | Purpose |
 | --- | --- | --- |
-| `RELAY_HOST` | `127.0.0.1` | bind host; read from `.env` by the systemd wrapper too |
+| `RELAY_HOST` | `0.0.0.0` | bind host; reachable from the network by default. `127.0.0.1` keeps it local |
 | `RELAY_PORT` | `4000` | proxy/dashboard port (also persisted via Settings) |
 | `RELAY_DB_PATH` | `web/backend/data/relay.db` | SQLite database |
 | `RELAY_LOG_DIR` | `web/backend/logs` | rotating JSON-lines logs |
 | `RELAY_LOG_LEVEL` | `INFO` | log verbosity |
-| `RELAY_ADMIN_TOKEN` | *(empty = open)* | admin plane auth (`X-Admin-Token`) |
-| `RELAY_REQUIRE_CLIENT_KEY` | `false` | enforce `Authorization: Bearer` on `/v1/*` |
-| `RELAY_API_KEY` | *(empty = generated)* | pin the client key instead of generating one on first boot |
 | `RELAY_PROBE_INTERVAL` | `15` | seconds between active health probes |
 | `RELAY_PROBE_TIMEOUT` | `5` | probe timeout |
 | `RELAY_UNHEALTHY_AFTER` | `3` | consecutive failures → `failed` (out of rotation) |
@@ -50,6 +48,18 @@ Settings screen. An `.env` file in `web/backend/` is also read.
 | `RELAY_WRITE_TIMEOUT` | `60` | upstream write timeout |
 | `RELAY_MAX_CONCURRENCY` | `18` | in-flight proxy slots; also the live gauge's ceiling |
 | `RELAY_FRONTEND_DIST` | `web/frontend/dist` | built dashboard to serve |
+
+The OpenCode side is configured under its own prefix, and is equally optional:
+
+| Var | Default | Purpose |
+| --- | --- | --- |
+| `OPENCODE_ENABLED` | `1` | register the agent endpoint at boot |
+| `OPENCODE_HOST` / `OPENCODE_PORT` | `127.0.0.1` / `4096` | where `opencode serve` is listening |
+| `OPENCODE_ENDPOINT_NAME` | `opencode` | endpoint name relay reconciles |
+| `OPENCODE_ALIAS` | `agent` | routing name clients send as `model` |
+| `OPENCODE_SERVER_USERNAME` | `opencode` | HTTP Basic user |
+| `OPENCODE_SERVER_PASSWORD` | *(generated)* | HTTP Basic password; minted into `OPENCODE_AUTH_FILE` on first launch |
+| `OPENCODE_AUTH_FILE` | `web/backend/data/opencode-auth.env` | where that generated credential lives |
 
 Runtime state lives in `web/backend/data/` and `web/backend/logs/` — both
 gitignored. Back up the SQLite file to preserve history; note that a live
@@ -118,19 +128,28 @@ but tunnel-backed endpoints stay disconnected until you connect them.
 
 ## Security posture
 
-- Bind to localhost or LAN. For remote access, put an authenticating proxy
-  (Cloudflare Access or equivalent) in front and set `RELAY_ADMIN_TOKEN` plus
-  `RELAY_REQUIRE_CLIENT_KEY`.
-- The admin plane is **open by default** — an unset `RELAY_ADMIN_TOKEN` means
-  no auth. That is deliberate for a localhost tool; set it before exposing the
-  port anywhere.
-- `GET /admin/proxy` returns the client API key in full, so it is only as
-  protected as the admin plane.
-- CORS is `*` while `allow_cors` is on. Turn it off, or fix the admin plane,
-  before exposing the port.
+**relay has no authentication.** Not on `/v1`, not on `/admin`. Anyone who can
+reach the port can send requests, read every stored prompt and completion, see
+each endpoint's URL, and edit the endpoint registry. That is a deliberate
+trade for a zero-setup tool, and the default bind is `0.0.0.0`. Know what you
+are exposing:
+
+- **An agent endpoint is a shell.** An OpenCode turn runs bash, edits files,
+  and writes to disk inside `OPENCODE_PROJECT_DIR`, on the machine hosting it,
+  for whoever calls the endpoint. Point that directory at something
+  disposable, or set `RELAY_HOST=127.0.0.1`. relay logs a warning at boot when
+  an agent endpoint is reachable on a non-loopback bind.
+- **Spend is capped, capability is not.** Only OpenCode models with `free` in
+  the id are servable (`adapters/opencode.py::is_free_model`), enforced at
+  discovery and again at forward time. So an open port cannot run up a model
+  bill — but it can still drive the agent.
+- For anything beyond a trusted network, put an authenticating proxy
+  (Cloudflare Access, a reverse proxy with basic auth, tailscale) in front.
+  relay will not do it for you.
+- CORS is `*` while `allow_cors` is on.
 - Upstream keys are stored server-side and injected on forward. The caller's
-  `Authorization` header is stripped as hop-by-hop, so a client key can never
-  reach an upstream and an upstream key never reaches a client.
+  `Authorization` header is stripped as hop-by-hop, so a caller's token can
+  never reach an upstream and an upstream key never reaches a client.
 - SSH commands are parsed into argv and exec'd directly — never through a
   shell — so a pasted command string is injection-safe. Keys are referenced by
   path; key material is never read or returned.

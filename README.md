@@ -11,33 +11,45 @@ records per-request telemetry rendered as Apache ECharts visualizations.
 - **Remote hosting** — interactive SSH tunnels run in a real pseudo-terminal,
   so host-key confirmations, passphrases, and password prompts are answered
   in the dashboard. Nothing connects on its own.
-- **Agent upstreams** — an [OpenCode](https://opencode.ai) server can be
-  registered as an endpoint; relay translates OpenAI chat requests into agent
-  sessions, with per-endpoint model allowlists so each provider model is
-  individually addressable. See [docs/opencode.md](docs/opencode.md).
+- **Agent upstreams** — an [OpenCode](https://opencode.ai) server is
+  registered automatically at boot; relay translates OpenAI chat requests into
+  agent sessions, and every free model the server offers is individually
+  addressable. See [docs/opencode.md](docs/opencode.md).
 - **Dashboard** — Astro + React + ECharts, fed by an ECharts-shaped stats API
   (`dimensions`/`source` payloads) backed by hourly rollups.
 
 ## Quickstart
 
 ```bash
-cd web/backend && uv sync && uv run uvicorn app.main:app --port 4000
+./launch.sh
 ```
 
-Point any OpenAI client at `http://127.0.0.1:4000/v1`. Build the dashboard
-once (`cd web/frontend && npm install && npm run build`) and the same process
-serves it at `http://127.0.0.1:4000/`.
-
-To bring relay up **together with an OpenCode agent server** — both processes,
-credentials, ports, and the agent endpoint registered automatically, all from
-one file:
+Nothing to configure. That starts `opencode serve` and relay together,
+generates the credentials the agent server needs, registers the agent endpoint,
+and discovers the free models it offers. Point any OpenAI client at
+`http://127.0.0.1:4000/v1` — **there is no API key**:
 
 ```bash
-cp .env.example .env && ./launch.sh
+curl http://127.0.0.1:4000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model": "agent", "messages": [{"role": "user", "content": "hi"}]}'
 ```
 
-Edit `.env` first (`OPENCODE_SERVER_PASSWORD` at minimum);
-`./launch.sh --list-models` prints the model ids your OpenCode server offers.
+`GET /v1/models` lists everything routable: the `agent` alias, every free
+OpenCode model by name, and any other endpoint you register. Build the
+dashboard once (`cd web/frontend && npm install && npm run build`) and the same
+process serves it at `http://127.0.0.1:4000/`.
+
+relay is unauthenticated and binds `0.0.0.0` by default, and an OpenCode turn
+runs shell commands on its host. Read the security posture in
+[deployment.md](docs/deployment.md) before putting it on a network you don't
+control.
+
+Backend alone, no agent server:
+
+```bash
+cd web/backend && uv sync && uv run uvicorn app.main:app --port 4000
+```
 
 For frontend work, run both dev servers instead — Astro on `:4321` proxies
 `/admin`, `/v1`, and `/health` to the backend on `:4000`:
@@ -50,22 +62,22 @@ For frontend work, run both dev servers instead — Astro on `:4321` proxies
 
 ```text
 root/
-├── launch.sh                # relay + opencode together, configured from .env
-├── .env.example             # template for .env (gitignored)
+├── launch.sh                # relay + opencode together, zero config
+├── .env.example             # optional overrides (.env is gitignored)
 ├── docs/                    # architecture, api-contract, routes, data-flow,
 │                            # frontend, deployment, opencode
 ├── web/
 │   ├── backend/             # FastAPI service (uv project)
 │   │   ├── app/
 │   │   │   ├── main.py      # app factory, lifespan, static dashboard serving
-│   │   │   ├── config.py    # pydantic-settings (RELAY_* env)
+│   │   │   ├── config.py    # pydantic-settings (RELAY_* / OPENCODE_* env)
 │   │   │   ├── db.py        # SQLite schema, migrations, rollup backfill
-│   │   │   ├── security.py  # admin guard, bearer extraction, key masking
+│   │   │   ├── security.py  # bearer extraction + masking (telemetry labels)
 │   │   │   ├── core/        # logging.py
 │   │   │   ├── routes/      # v1.py + admin_{endpoints,settings,stats,tunnels}.py
 │   │   │   ├── services/    # proxy, router, health, stats, rollup, histogram,
-│   │   │   │                # telemetry, settings_store, tunnels,
-│   │   │   │                # tunnel_sessions, ssh_config
+│   │   │   │                # telemetry, settings_store, opencode_boot,
+│   │   │   │                # tunnels, tunnel_sessions, ssh_config
 │   │   │   └── schemas/     # Pydantic models (the API contract)
 │   │   ├── data/            # runtime SQLite (gitignored)
 │   │   ├── logs/            # rotating JSON-lines logs (gitignored)
@@ -80,9 +92,9 @@ root/
 │       │   └── hooks/       # usePoll
 │       ├── astro.config.mjs
 │       └── package.json
-├── tests/backend/           # pytest suite (136 tests)
+├── tests/backend/           # pytest suite (149 tests)
 ├── utils/                   # seed_telemetry.py
-├── scripts/                 # dev.sh, relay, install-systemd.sh, validate_live.sh
+├── scripts/                 # dev.sh, relay, opencode-auth.sh, install-systemd.sh
 └── deploy/systemd/          # relay.service + opencode.service (user units)
 ```
 
@@ -107,10 +119,10 @@ Against live model servers:
 | Doc | Covers |
 | --- | --- |
 | [architecture.md](docs/architecture.md) | Subsystems, routing resolution, health state machine, storage/rollup strategy |
-| [api-contract.md](docs/api-contract.md) | Object shapes, stats payloads, auth |
+| [api-contract.md](docs/api-contract.md) | Object shapes, stats payloads, why there is no auth |
 | [routes.md](docs/routes.md) | Every HTTP route |
 | [data-flow.md](docs/data-flow.md) | Hot path, poll loops, control-plane writes, logging |
-| [opencode.md](docs/opencode.md) | Fronting an OpenCode agent server: setup, model allowlists, gotchas |
+| [opencode.md](docs/opencode.md) | Fronting an OpenCode agent server: setup, the free-model policy, gotchas |
 | [frontend.md](docs/frontend.md) | Component map, design tokens, chart conventions |
 | [deployment.md](docs/deployment.md) | Single-process production, env vars, systemd, security posture |
 

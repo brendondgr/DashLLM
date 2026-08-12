@@ -5,11 +5,15 @@ expose it through the ordinary OpenAI API, with full telemetry. Any OpenAI
 client works unchanged:
 
 ```python
-client = OpenAI(base_url="http://127.0.0.1:4000/v1", api_key="...")
+# api_key is required by the SDK, ignored by relay
+client = OpenAI(base_url="http://127.0.0.1:4000/v1", api_key="unused")
 client.chat.completions.create(
     model="agent",                       # the endpoint's alias
     messages=[{"role": "user", "content": "what changed in this repo today?"}])
 ```
+
+Only **free** models are served — the ones with `free` in the id. See
+[Model policy](#model-policy).
 
 ## What relay is actually doing
 
@@ -19,12 +23,12 @@ relay translates rather than forwards:
 | OpenAI (what your client sends) | OpenCode (what relay sends) |
 | --- | --- |
 | stateless `POST /v1/chat/completions` | `POST /session` → `POST /session/{id}/message` → `DELETE /session/{id}` |
-| `"model": "anthropic/claude-sonnet-4-5"` | `{"model": {"providerID": "anthropic", "modelID": "claude-sonnet-4-5"}}` |
+| `"model": "opencode/hy3-free"` | `{"model": {"providerID": "opencode", "modelID": "hy3-free"}}` |
 | `messages[].content` | `parts: [{"type": "text", "text": "..."}]` |
 | a `role: "system"` message | the message body's top-level `system` field |
 | `choices[0].message.content` | concatenated `parts[*].text` |
 | `usage.*_tokens` | `info.tokens` (+ `info.cost`, taken as authoritative) |
-| `Authorization: Bearer <key>` | `Authorization: Basic base64(user:password)` |
+| *(no credential; relay has no auth)* | `Authorization: Basic base64(user:password)` |
 
 Sessions are **ephemeral**: one per request, deleted in a `finally`, and
 `abort`ed first if the client hung up or the turn hit its deadline. Relay
@@ -34,29 +38,23 @@ keeps no agent state.
 
 ### The short way: `./launch.sh`
 
-From the repo root, one file configures both servers and registers the
-endpoint:
-
-```bash
-cp .env.example .env
-```
-
-Set `OPENCODE_SERVER_PASSWORD` (required), and usually `OPENCODE_PROJECT_DIR`
-— `opencode serve` binds to one directory and its `bash`/`edit`/`write` tools
-act there, so it defaults to this repo, which is rarely what you want. Then:
-
 ```bash
 ./launch.sh
 ```
 
-It starts `opencode serve`, starts relay, waits for both to answer, and
-creates or updates the relay endpoint from `.env` — idempotent, so re-running
-after an edit converges rather than duplicating. Ctrl-C stops both. To fill in
-`OPENCODE_MODELS`, ask the server what it has:
+That is the whole procedure. No `.env`, no arguments. It mints the HTTP Basic
+credentials `opencode serve` demands (`scripts/opencode-auth.sh`, stored in
+`web/backend/data/opencode-auth.env`), starts both servers, and waits for them
+to answer. relay registers the agent endpoint itself during startup and then
+discovers the free models the server offers — see
+`app/services/opencode_boot.py`. Ctrl-C stops both.
 
-```bash
-./launch.sh --list-models
-```
+The one setting worth thinking about is `OPENCODE_PROJECT_DIR`: `opencode
+serve` binds to one directory and its `bash`/`edit`/`write` tools act there.
+It defaults to this repo, which is rarely what you want.
+
+`GET /v1/models` lists what ended up routable; `launch.sh` prints it on
+startup too.
 
 If relay is already running as a systemd service on the same port, `launch.sh`
 says so; `./launch.sh --takeover` stops the service first.
@@ -75,9 +73,9 @@ one command drives both:
 
 | Command | Effect |
 | --- | --- |
-| `relay start` | starts relay + opencode, then registers the endpoint from `.env` |
+| `relay start` | starts relay + opencode; relay registers the endpoint at boot |
 | `relay stop` | stops both |
-| `relay restart` | restarts both and re-registers |
+| `relay restart` | restarts both |
 | `relay status` | unit state for both, relay health, and each endpoint's health |
 | `relay logs` | follows both journals |
 | `relay enable` / `disable` | on-boot behavior for both |
@@ -85,10 +83,11 @@ one command drives both:
 Add `--relay-only` to any of them to leave the agent server alone.
 
 `OPENCODE_ENABLED=0` in `.env` takes opencode out entirely: `relay` skips the
-unit, and the unit itself exits without starting if something else launches it.
-The wrapper also refuses to start (exit 78, no restart loop) when
-`OPENCODE_SERVER_PASSWORD` is empty, rather than serving an unauthenticated
-agent.
+unit, the unit itself exits without starting if something else launches it,
+and relay does not register the endpoint. The wrapper sources the same
+`scripts/opencode-auth.sh` as `launch.sh`, so the systemd path and the
+foreground path always agree on the password — and neither ever serves an
+unauthenticated agent.
 
 Both units take `RELAY_HOST`, `RELAY_PORT`, `OPENCODE_PORT`, and
 `OPENCODE_PROJECT_DIR` from `.env` — nothing is baked into the unit files, so a
@@ -96,27 +95,17 @@ re-install cannot revert a local change. Re-run
 `./scripts/install-systemd.sh` after pulling this change; it also refreshes
 `~/.local/bin/relay` if you installed it there.
 
-### Three different keys
+### Two credentials, neither of them yours to send
 
-Nothing about this setup is served by confusing them:
+relay itself takes no key. The two that exist are both *upstream* of it:
 
-| Key | In `.env` | Who checks it |
+| Credential | Where it comes from | Who checks it |
 | --- | --- | --- |
-| Relay's client key | `RELAY_API_KEY` | relay, on `/v1/*`, when `RELAY_REQUIRE_CLIENT_KEY=1`. Leave empty to have one generated; `launch.sh` prints it either way. |
-| OpenCode's server password | `OPENCODE_SERVER_USERNAME` / `OPENCODE_SERVER_PASSWORD` | `opencode serve`, as HTTP Basic. Relay presents it as the endpoint's `upstream_key`. |
-| The provider's API key | `OPENCODE_API_KEY`, `ANTHROPIC_API_KEY`, … | Anthropic/OpenAI/OpenCode Zen, when the agent calls the model. `launch.sh` exports these into the opencode process; the alternative is `opencode auth login`. |
+| OpenCode's server password | generated into `web/backend/data/opencode-auth.env`, or pinned with `OPENCODE_SERVER_USERNAME` / `OPENCODE_SERVER_PASSWORD` | `opencode serve`, as HTTP Basic. relay presents it as the endpoint's `upstream_key`. |
+| The provider's API key | `OPENCODE_API_KEY` (or `opencode auth login`) | OpenCode Zen, when the agent calls the model. `launch.sh` exports it into the opencode process. |
 
-`./launch.sh --list-models` prints ids as `provider/model`, and the provider
-prefix tells you which of the third row you need — `opencode/…` wants
-`OPENCODE_API_KEY`, `anthropic/…` wants `ANTHROPIC_API_KEY`. A locally hosted
-provider usually needs none.
-
-To register an endpoint against an already-running relay without launching
-anything:
-
-```bash
-set -a; . ./.env; set +a; python3 scripts/register_opencode.py
-```
+The provider prefix on a model id says which provider credential is in play —
+`opencode/…` wants `OPENCODE_API_KEY`. A locally hosted provider needs none.
 
 ### The manual way
 
@@ -135,40 +124,41 @@ set -a; . ./.env; set +a; python3 scripts/register_opencode.py
    | alias | e.g. `agent` — the routing name clients send as `model` |
    | url | `http://127.0.0.1:4096` (**no** `/v1` suffix) |
    | key | `user:password`, or a bare password for the default user `opencode` |
-   | available models | one `provider/model` id per line |
+   | available models | one `provider/model` id per line — free ids only |
 
    The key must match the server's `OPENCODE_SERVER_USERNAME` /
    `OPENCODE_SERVER_PASSWORD`.
 
 3. **Test connection** hits `/global/health` and reads `/config/providers`.
 
-## Choosing models
+## Model policy
 
-An OpenCode server fronts many provider models, so an alias alone is a blunt
-handle. The **available models** list makes each one individually addressable:
+**Free models only.** A model is servable if its id contains `free`
+(`adapters/opencode.py::is_free_model`) — `opencode/hy3-free`,
+`opencode/nemotron-3-ultra-free`, and so on. Anything else is refused with a
+`400`.
 
-```
-anthropic/claude-sonnet-4-5
-anthropic/claude-haiku-4-5
-openai/gpt-5
-```
+That rule is what makes an unauthenticated relay tolerable: relay has no auth
+layer, so whoever reaches the port spends whatever the OpenCode account is
+authenticated for. Capping the model set caps the bill. It is enforced twice —
+paid models are dropped from the catalog at discovery, so they never reach the
+router or `/v1/models`, and `forward()` refuses one again even if a paid id
+was typed into an endpoint's allowlist or set as its `model_override`.
 
-With that list:
+Discovery publishes what it finds as the endpoint's **available models** list,
+which is what makes each one individually addressable:
 
-- `GET /v1/models` advertises all three alongside the `agent` alias, so a
+- `GET /v1/models` advertises every free id alongside the `agent` alias, so a
   client's model picker shows them.
-- `"model": "openai/gpt-5"` routes to this endpoint and forwards **exactly**
-  that model — the list outranks `model_override`.
-- `"model": "agent"` uses the endpoint's default: `model_override` (set from
-  `OPENCODE_MODEL` in `.env`) if present, otherwise the first allowlisted id
-  the probe confirmed. Set `OPENCODE_MODEL` — the discovered order is
-  OpenCode's, and the model it happens to list first may not be one your
-  account can bill.
-- The endpoint will not serve a model that is not on the list, and the ids
-  cannot collide with another endpoint's alias or allowlist.
+- `"model": "opencode/hy3-free"` routes to this endpoint and forwards
+  **exactly** that model — the list outranks `model_override`.
+- `"model": "agent"` uses the endpoint's default: `model_override` if it is
+  free, otherwise the first discovered free model. The alias never falls
+  through to OpenCode's *own* default, which is normally a paid one.
+- The ids cannot collide with another endpoint's alias or allowlist.
 
-Leave it empty to serve only the alias, on whatever model OpenCode defaults
-to. An id with no `provider/` prefix is not sent at all — OpenCode picks.
+The list is reconciled from the server at every boot. Narrowing it by hand in
+the dashboard holds until the next restart.
 
 Clients may also pass a non-standard `"agent"` field (`build`, `plan`, a
 custom agent) in the request body; it is forwarded when present.
@@ -193,10 +183,11 @@ custom agent) in the request body; it is forwarded when present.
   the permissions you actually want instead of relying on the deadline.
 
 - **This is remote code execution by design.** OpenCode's `bash`, `edit`, and
-  `write` tools run against the directory the server was started in. Anyone
-  who can reach relay can drive them. Run relay with
-  `RELAY_REQUIRE_CLIENT_KEY=1`; it logs a warning at boot if an agent endpoint
-  is registered without it.
+  `write` tools run against the directory the server was started in. relay has
+  no auth, so anyone who can reach the port can drive them — the free-model
+  policy caps the bill, not the capability. Point `OPENCODE_PROJECT_DIR` at
+  something disposable, or set `RELAY_HOST=127.0.0.1`. relay logs a warning at
+  boot when an agent endpoint is reachable on a non-loopback bind.
 
 - **One server = one project.** `opencode serve` is bound to its launch
   directory. Several projects means several servers means several relay

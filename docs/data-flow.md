@@ -3,9 +3,10 @@
 ## Proxied request (hot path)
 
 1. Client calls e.g. `POST /v1/chat/completions` on relay (`:4000`).
-   `app/routes/v1.py` validates the client key locally when
-   `RELAY_REQUIRE_CLIENT_KEY` is on, then hands the request to
-   `ProxyService.handle`.
+   `app/routes/v1.py` hands it straight to `ProxyService.handle` — there is
+   no key to check. If the caller sent `Authorization: Bearer …` anyway (most
+   OpenAI SDKs require the field), the last four characters are kept as a
+   `client_key` label for telemetry and nothing else.
 2. `GET /v1/models` short-circuits here: relay answers from its own registry
    and never forwards.
 3. The body is parsed once. If `model` matches an endpoint `alias`, the
