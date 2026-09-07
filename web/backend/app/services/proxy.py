@@ -13,12 +13,16 @@
 - passive failure signals feed the router; transparent retry on another
   endpoint happens only before the first byte reaches the client
 - telemetry is recorded off the hot path via the async writer
+- admission is bounded at the door (see ``AdmissionGate``): past a point the
+  honest answer to a burst is 429, not a queue nobody is still waiting on
 """
 
 import asyncio
 import json
 import time
 import uuid
+from collections.abc import Callable
+from contextlib import asynccontextmanager
 
 import httpx
 from fastapi import Request
@@ -30,6 +34,7 @@ from app.services.adapters import (
     HOP_BY_HOP as _HOP_BY_HOP,
     RetryableUpstreamError as _RetryableUpstreamError,
     StaleModelOverride as _StaleModelOverride,
+    UpstreamSaturated as _UpstreamSaturated,
     get_adapter,
 )
 from app.services.telemetry import RequestRecord
@@ -114,16 +119,123 @@ def _collect_stream_text(buf: bytes) -> str:
     return "".join(out)[:_BODY_LIMIT]
 
 
+class Overloaded(Exception):
+    """Relay refused the request at the door rather than queueing it."""
+
+    def __init__(self, reason: str, retry_after: int):
+        super().__init__(reason)
+        self.reason = reason
+        self.retry_after = retry_after
+
+
+class AdmissionGate:
+    """Bounded admission control for the forwarding hot path.
+
+    Three numbers, not one:
+
+    - ``max_concurrency`` — attempts in flight at an upstream at once.
+    - ``queue_limit`` — how many *more* may wait for a slot. This is the one
+      that was missing. A bare semaphore has an unbounded wait queue, so a
+      burst of 300 against 18 slots parked 282 callers behind agent turns
+      that may run for minutes; by the time a slot freed, the client had
+      long since given up, and relay still spent an upstream turn on it.
+    - ``queue_timeout`` — how long a waiter may sit there before relay
+      answers 429 itself instead of letting the caller's own timeout decide.
+
+    Shedding at the door is what keeps p99 finite when arrivals outrun the
+    upstream: a request that will not start for two minutes is better served
+    a Retry-After now. ``queue_timeout <= 0`` restores the old unbounded
+    wait, and ``queue_limit <= 0`` means "never queue".
+    """
+
+    def __init__(self, max_concurrency: int, queue_limit: int = 512,
+                 queue_timeout: float = 30.0):
+        self.max_concurrency = max(1, max_concurrency)
+        self.queue_limit = max(0, queue_limit)
+        self.queue_timeout = queue_timeout
+        self._slots = asyncio.Semaphore(self.max_concurrency)
+        self._active = 0
+        self._waiting = 0
+
+    @property
+    def active(self) -> int:
+        return self._active
+
+    @property
+    def waiting(self) -> int:
+        return self._waiting
+
+    async def acquire(self, queue: bool = True) -> "Callable[[], None]":
+        """Take a slot, or raise :class:`Overloaded`. Returns the (idempotent)
+        release callable — a slot outlives the coroutine that took it, because
+        a streamed response is still occupying the upstream long after the
+        handler returned.
+        """
+        # Checked before incrementing the waiter count, so the limit counts
+        # callers actually parked on the semaphore and not this one.
+        if self._slots.locked():
+            if not queue or self.queue_limit <= 0:
+                raise Overloaded("concurrency limit reached", 1)
+            if self._waiting >= self.queue_limit:
+                raise Overloaded(
+                    f"queue full: {self._waiting} requests already waiting"
+                    f" for one of {self.max_concurrency} slots", 5)
+        self._waiting += 1
+        try:
+            await asyncio.wait_for(
+                self._slots.acquire(),
+                self.queue_timeout if self.queue_timeout > 0 else None)
+        except (TimeoutError, asyncio.TimeoutError):
+            raise Overloaded(
+                f"waited {self.queue_timeout:.0f}s for a free upstream slot",
+                5) from None
+        finally:
+            self._waiting -= 1
+        self._active += 1
+        released = False
+
+        def release() -> None:
+            nonlocal released
+            if released:
+                return
+            released = True
+            self._active -= 1
+            self._slots.release()
+
+        return release
+
+    @asynccontextmanager
+    async def slot(self, queue: bool = True):
+        release = await self.acquire(queue=queue)
+        try:
+            yield
+        finally:
+            release()
+
+    def snapshot(self) -> dict:
+        return {"active": self._active, "waiting": self._waiting,
+                "max_concurrency": self.max_concurrency,
+                "queue_limit": self.queue_limit}
+
+
 class ProxyService:
     def __init__(self, http: httpx.AsyncClient, router, telemetry, live,
-                 settings, max_concurrency: int = 18):
+                 settings, max_concurrency: int = 64,
+                 queue_limit: int = 512, queue_timeout: float = 30.0,
+                 max_body_bytes: int = 8 * 1024 * 1024):
         self.http = http
         self.router = router
         self.telemetry = telemetry
         self.live = live
         self.settings = settings
         self.max_concurrency = max_concurrency
-        self._slots = asyncio.Semaphore(max_concurrency)
+        self.max_body_bytes = max_body_bytes
+        self.gate = AdmissionGate(
+            max_concurrency, queue_limit=queue_limit,
+            queue_timeout=queue_timeout)
+        # req_id -> gate release. A streamed reply holds its slot until the
+        # stream ends (see ``finish``), so the registry outlives handle().
+        self._slot_releases: dict[str, Callable[[], None]] = {}
 
     # ---- entrypoint ------------------------------------------------------
     async def handle(self, request: Request, path: str) -> Response:
@@ -136,7 +248,12 @@ class ProxyService:
         if route == "models" and request.method == "GET":
             return self._models_catalog()
 
-        body_bytes = await request.body()
+        body_bytes = await self._read_body(request)
+        if body_bytes is None:
+            log.warning("rejecting oversized request body", extra={"data": {
+                "id": req_id, "route": route, "limit": self.max_body_bytes}})
+            return _upstream_error(
+                413, f"request body exceeds {self.max_body_bytes} bytes")
         body_json = self._parse_json(body_bytes)
 
         # Model routing: a request whose "model" names an endpoint alias, or a
@@ -202,27 +319,106 @@ class ProxyService:
             "stream": want_stream, "client_key": client_key,
             "endpoint_name": None, "temperature": record.temperature,
             "max_tokens": record.max_tokens})
+        # Admission gate: run now, wait for a bounded time, or shed. The slot
+        # is held until the *whole* reply is delivered, which for a stream is
+        # long after this coroutine returns — releasing it at header time made
+        # `max_concurrency` a limit on time-to-first-byte rather than on load,
+        # and left synthesized-SSE protocols (OpenCode) effectively ungated.
+        try:
+            self._slot_releases[req_id] = await self.gate.acquire(
+                queue=settings.queue_requests)
+        except Overloaded as e:
+            self.live.finish(req_id)
+            return self._shed(record, t0, e)
+
         stream_owns_finish = False
         try:
-            # Concurrency gate: queue (default) or reject with 429.
-            if self._slots.locked() and not settings.queue_requests:
-                log.warning("rejecting request; concurrency limit",
-                            extra={"data": {"id": req_id, "route": route}})
-                return _upstream_error(429, "concurrency limit reached")
-            async with self._slots:
-                response = await self._dispatch(
-                    request, path, record, body_bytes, t0,
-                    force_endpoint=alias_endpoint,
-                    body_json=dispatch_body_json,
-                    pinned_model=pinned_model)
+            response = await self._dispatch(
+                request, path, record, body_bytes, t0,
+                force_endpoint=alias_endpoint,
+                body_json=dispatch_body_json,
+                pinned_model=pinned_model)
             # A streaming response stays in-flight until its stream ends; the
-            # tee generator calls live.finish() itself. Everything else (a
+            # tee generator calls proxy.finish() itself. Everything else (a
             # buffered body or an error response) is done now.
             stream_owns_finish = isinstance(response, StreamingResponse)
             return response
         finally:
             if not stream_owns_finish:
-                self.live.finish(req_id)
+                self.finish(req_id)
+
+    def finish(self, req_id: str) -> None:
+        """One request is completely done: drop it from the live registry and
+        give its concurrency slot back.
+
+        Every path that ends a request funnels through here — the buffered
+        return in ``handle``, the SSE tee, an adapter's synthesized stream —
+        so a slot can never be leaked by an exit route that forgot one half.
+        """
+        self.live.finish(req_id)
+        release = self._slot_releases.pop(req_id, None)
+        if release is not None:
+            release()
+
+    async def _read_body(self, request: Request) -> bytes | None:
+        """Read the request body, refusing anything over the cap.
+
+        ``request.body()`` buffers the whole payload in memory with no bound.
+        One 2 GB POST is enough to take the process down, and under load a
+        handful of merely large ones does the same — so the limit is enforced
+        while streaming rather than after the fact. Returns None when the cap
+        is exceeded.
+        """
+        declared = request.headers.get("content-length")
+        if declared and declared.isdigit() and int(declared) > self.max_body_bytes:
+            return None
+        chunks: list[bytes] = []
+        size = 0
+        async for chunk in request.stream():
+            size += len(chunk)
+            if size > self.max_body_bytes:
+                return None
+            chunks.append(chunk)
+        return b"".join(chunks)
+
+    def _shed(self, record: RequestRecord, t0: float,
+              e: Overloaded) -> JSONResponse:
+        """Answer a request relay declined to admit. Recorded like any other
+        outcome — load shedding that does not show up on the dashboard is
+        indistinguishable from the relay being slow."""
+        record.status = 429
+        record.ok = False
+        record.error = f"shed: {e.reason}"
+        record.latency_ms = (time.perf_counter() - t0) * 1000
+        self.telemetry.submit(record)
+        log.warning("shedding request", extra={"data": {
+            "id": record.id, "route": record.route, "reason": e.reason,
+            "active": self.gate.active, "waiting": self.gate.waiting}})
+        resp = _upstream_error(429, e.reason)
+        resp.headers["Retry-After"] = str(e.retry_after)
+        return resp
+
+    def _saturated(self, record: RequestRecord, t0: float,
+                   e: _UpstreamSaturated) -> JSONResponse:
+        """Relay ran out of local capacity mid-attempt.
+
+        Deliberately *not* routed through ``router.report_failure``: the
+        upstream never saw this request. Blaming it here is how three
+        simultaneous pool timeouts used to mark a healthy endpoint FAILED and
+        take the entire pool out of rotation.
+        """
+        record.status = 503
+        record.ok = False
+        record.error = str(e)[:500]
+        record.latency_ms = (time.perf_counter() - t0) * 1000
+        self.telemetry.submit(record)
+        log.error("local capacity exhausted", extra={"data": {
+            "id": record.id, "endpoint": record.endpoint_name,
+            "active": self.gate.active, "waiting": self.gate.waiting,
+            "error": str(e)[:200]}})
+        resp = _upstream_error(503, str(e))
+        resp.headers["Retry-After"] = "1"
+        return resp
 
     def _parse_json(self, body: bytes) -> dict | None:
         if not body:
@@ -315,6 +511,8 @@ class ProxyService:
                 return await self._forward_healing(
                     request, force_endpoint, path, record,
                     lambda: body_for(force_endpoint), t0)
+            except _UpstreamSaturated as e:
+                return self._saturated(record, t0, e)
             except _RetryableUpstreamError as e:
                 self.router.report_failure(force_endpoint["id"], str(e))
                 record.error = str(e)[:500]
@@ -348,6 +546,10 @@ class ProxyService:
                 return await self._forward_healing(
                     request, endpoint, path, record,
                     lambda: body_for(endpoint), t0)
+            except _UpstreamSaturated as e:
+                # Every endpoint shares one connection pool, so failing over
+                # would just queue against the same exhausted resource.
+                return self._saturated(record, t0, e)
             except _RetryableUpstreamError as e:
                 self.router.report_failure(endpoint["id"], str(e))
                 log.warning("upstream failed pre-first-byte", extra={"data": {
@@ -551,7 +753,7 @@ class ProxyService:
                 raise
             finally:
                 await resp.aclose()
-                self.live.finish(record.id)
+                self.finish(record.id)
                 self._finalize_stream(
                     resp, endpoint, record, t0, tail, body_buf,
                     chunk_count, error)

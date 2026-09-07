@@ -43,7 +43,33 @@ class Config(BaseSettings):
     read_timeout: float = 600.0
     write_timeout: float = 60.0
 
-    max_concurrency: int = 18
+    # How many attempts relay has at an upstream simultaneously. This bounds
+    # the *model server*, not the number of clients relay can hold: arrivals
+    # past this wait in a bounded queue (below) or are shed with 429. See
+    # docs/deployment.md for sizing.
+    max_concurrency: int = 256
+    # Requests allowed to wait for a slot. max_concurrency + queue_limit is
+    # the number of live requests relay carries before it starts refusing;
+    # the defaults hold ~2300, comfortably past the 1024-connection target.
+    queue_limit: int = 2048
+    # Seconds a queued request may wait before relay answers 429 itself. A
+    # caller that will not be served for a minute is better told now.
+    queue_timeout: float = 30.0
+    # Hard cap on an inbound request body. `Request.body()` is unbounded, so
+    # without this one large POST is a memory incident.
+    max_body_bytes: int = 8 * 1024 * 1024
+
+    # Upstream HTTP connection pool. Sized from max_concurrency at boot (see
+    # main.lifespan) unless set explicitly: a pool smaller than the gate lets
+    # PoolTimeout — a *local* failure — masquerade as an unhealthy endpoint.
+    pool_connections: int = 0  # 0 = derive from max_concurrency
+    pool_keepalive: int = 0    # 0 = derive from max_concurrency
+    pool_timeout: float = 10.0
+
+    # Threads serving SQLite. Its own pool, not asyncio's shared default
+    # executor: dashboard queries and telemetry writes must not be able to
+    # starve each other or anything else that offloads to a thread.
+    db_threads: int = 8
 
     frontend_dist: Path = BACKEND_DIR.parent / "frontend" / "dist"
 

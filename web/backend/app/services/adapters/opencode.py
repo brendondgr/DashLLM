@@ -52,7 +52,11 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from app.core.logging import get_logger
 from app.schemas import EndpointTestResult
-from app.services.adapters.base import RetryableUpstreamError, UpstreamAdapter
+from app.services.adapters.base import (
+    RetryableUpstreamError,
+    UpstreamAdapter,
+    classify_httpx_error,
+)
 from app.services.telemetry import RequestRecord
 
 log = get_logger("opencode")
@@ -392,7 +396,7 @@ class OpenCodeAdapter(UpstreamAdapter):
                 f"{base}/session", headers=headers,
                 json={"title": f"relay {record.id}"}, timeout=_SETUP_TIMEOUT)
         except httpx.HTTPError as e:
-            raise RetryableUpstreamError(f"{type(e).__name__}: {e}") from e
+            raise classify_httpx_error(e) from e
         if created.status_code >= 400:
             raise RetryableUpstreamError(
                 f"HTTP {created.status_code} creating session: "
@@ -433,7 +437,7 @@ class OpenCodeAdapter(UpstreamAdapter):
                 "(check the OpenCode instance's permission config)",
                 status=504) from e
         except httpx.HTTPError as e:
-            raise RetryableUpstreamError(f"{type(e).__name__}: {e}") from e
+            raise classify_httpx_error(e) from e
         except (asyncio.CancelledError, GeneratorExit):
             aborted = True
             raise
@@ -557,8 +561,8 @@ class OpenCodeAdapter(UpstreamAdapter):
 
         Every OpenAI client works against this; the only lie is TTFT, which
         equals total latency because there is nothing earlier to report.
-        ``handle()`` hands live.finish() to a StreamingResponse, so this
-        generator owns it.
+        ``handle()`` hands the request's completion — live tracking and the
+        admission slot — to a StreamingResponse, so this generator owns it.
         """
         chunk_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
 
@@ -624,7 +628,10 @@ class OpenCodeAdapter(UpstreamAdapter):
                 proxy.telemetry.submit(record)
                 raise
             finally:
-                proxy.live.finish(record.id)
+                # Releases the admission slot too: the whole agent turn runs
+                # inside this generator, so gating only up to the headers
+                # would leave it entirely unbounded.
+                proxy.finish(record.id)
 
         return StreamingResponse(gen(), status_code=200,
                                  media_type="text/event-stream")
