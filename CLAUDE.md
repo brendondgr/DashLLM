@@ -96,6 +96,28 @@ backend changes and `npm run build` + `relay restart` picks up frontend ones.
   last until the next restart. It is in-process precisely so launch.sh,
   systemd, and a bare uvicorn behave identically — don't move it back into a
   setup script.
+- **Relay's own saturation must never look like a broken endpoint.** Three
+  things enforce that and all three are load-bearing: probes have their own
+  httpx pool (`app.state.probe_http`), `PoolTimeout` is classified as
+  `UpstreamSaturated` and skips `report_failure`, and only a *failing probe*
+  can move an endpoint to `failed` — request failures alone stop at
+  `degraded`. Each was, separately, a way for a busy relay to 503 everything
+  while the model server behind it was fine. `./scripts/stress.sh` is the
+  reproduction.
+- **A concurrency slot covers the whole reply, not the headers.** Everything
+  ending a request goes through `ProxyService.finish()`, which drops the live
+  row *and* releases the gate. Releasing at header time leaves synthesized-SSE
+  protocols (OpenCode runs the entire agent turn inside its response
+  generator) completely ungated.
+- **`max_concurrency` is not a throughput dial.** Past the upstream's own
+  capacity, raising it lowers throughput and raises p99 — measured. Size the
+  *queue* for the client count and `max_concurrency` for the model server; see
+  docs/deployment.md.
+- **Nothing in the request path may block the event loop.** Logging goes
+  through a `QueueListener` thread, SQLite through `Database`'s own executor
+  with per-thread cached readers, and `stats` uses only the `a*` wrappers. A
+  plain `db.query()` or a bare `logging` file handler on an async path is a
+  stall for every concurrent request, and it only shows up under load.
 - **`Router.sync_allowlist` is called from the boot reconcile only.** From the
   probe loop it would overwrite an operator's narrowed allowlist fifteen
   seconds after they set it.
@@ -141,9 +163,16 @@ backend changes and `npm run build` + `relay restart` picks up frontend ones.
   is gitignored, so an overwrite is unrecoverable. `launch.sh --env-file` and
   a scratch path exist for testing.
 
+End-to-end load check (stub upstream + throwaway relay, scratch paths only —
+nothing touches the real DB, logs, or `.env`):
+
+```bash
+./scripts/stress.sh
+```
+
 ## Testing
 
-149 tests in `tests/backend/`, all against fake upstream ASGI apps
+163 tests in `tests/backend/`, all against fake upstream ASGI apps
 (`fake_upstream.py`, routed by hostname: `good` / `strict` / `opencode` /
 `flaky` / dead) — no real model server, agent server, or SSH host required.
 Tunnel lifecycle is tested with an injectable fake command, since real SSH
@@ -151,6 +180,9 @@ can't be exercised in CI.
 
 When adding a proxy or router behavior, add the case to `test_proxy.py` or
 `test_router.py` rather than only validating by hand against a live server.
+Behavior that only appears under concurrency — admission, shedding, slot
+ownership, saturation-vs-failure — belongs in `test_load.py`, which asserts it
+deterministically; `scripts/stress.sh` is for measuring, not for gating.
 
 Note that `httpx.ASGITransport` ignores request timeouts, so a deadline that
 must hold in tests has to be enforced by relay (`asyncio.wait_for`), not
