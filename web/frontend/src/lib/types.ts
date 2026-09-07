@@ -171,6 +171,12 @@ export interface RecentResponse {
 export interface LiveSnapshot {
   in_flight: number;
   max_concurrency: number;
+  /** At an upstream right now (<= max_concurrency). */
+  active: number;
+  /** Admitted but queued for a slot; non-zero means relay is the bottleneck. */
+  waiting: number;
+  /** Queue depth past which requests are shed with 429. */
+  queue_limit: number;
   series: [number, number][];
 }
 

@@ -8,6 +8,7 @@
 """
 
 import asyncio
+import logging
 import time
 import zlib
 from collections import deque
@@ -21,6 +22,20 @@ from app.services.rollup import HIST_UPSERT, SUM_UPSERT, build_rollup_rows
 log = get_logger("telemetry")
 
 _STOP = object()
+
+# Records the writer will hold before it starts dropping, and how many it
+# folds into one transaction. Deep enough to absorb a burst of a few
+# thousand requests while the previous batch is still committing.
+_QUEUE_DEPTH = 50_000
+_BATCH_SIZE = 500
+
+# Rows deleted per retention pass before the writer gets the lock back.
+_PRUNE_CHUNK = 5_000
+
+# Seconds between "telemetry queue full" reports. Overflow happens exactly
+# when the process is already struggling; one log line per dropped record
+# turns a hiccup into a log storm that makes it worse.
+_DROP_LOG_INTERVAL = 10.0
 
 # Request bodies (prompts/completions) are natural-language / JSON text that
 # compresses ~3-5x. We store them zlib-deflated as BLOBs so "log bodies" +
@@ -104,17 +119,24 @@ def _row(r: RequestRecord) -> tuple:
 class TelemetryWriter:
     def __init__(self, db: Database):
         self.db = db
-        self.queue: asyncio.Queue = asyncio.Queue(maxsize=10_000)
+        self.queue: asyncio.Queue = asyncio.Queue(maxsize=_QUEUE_DEPTH)
         self._task: asyncio.Task | None = None
         self._last_prune = 0.0
         self.written = 0
+        self.dropped = 0
+        self._last_drop_log = 0.0
 
     def submit(self, record: RequestRecord) -> None:
         try:
             self.queue.put_nowait(record)
         except asyncio.QueueFull:  # pragma: no cover - backpressure guard
-            log.error("telemetry queue full; dropping record",
-                      extra={"data": {"id": record.id}})
+            self.dropped += 1
+            now = time.monotonic()
+            if now - self._last_drop_log >= _DROP_LOG_INTERVAL:
+                self._last_drop_log = now
+                log.error("telemetry queue full; dropping records",
+                          extra={"data": {"id": record.id,
+                                          "dropped_total": self.dropped}})
 
     async def start(self) -> None:
         self._task = asyncio.create_task(self._run(), name="telemetry-writer")
@@ -139,7 +161,7 @@ class TelemetryWriter:
                 self.queue.task_done()
                 return
             batch = [item]
-            while not self.queue.empty() and len(batch) < 100:
+            while not self.queue.empty() and len(batch) < _BATCH_SIZE:
                 nxt = self.queue.get_nowait()
                 if nxt is _STOP:
                     await self._write(batch)
@@ -154,29 +176,36 @@ class TelemetryWriter:
 
     async def _write(self, batch: list[RequestRecord]) -> None:
         try:
-            await self.db.aexecutemany(_INSERT, [_row(r) for r in batch])
             bodies = [
                 (r.id, body_pack(r.prompt_body), body_pack(r.completion_body))
                 for r in batch
                 if r.prompt_body is not None or r.completion_body is not None
             ]
-            if bodies:
-                await self.db.aexecutemany(_INSERT_BODY, bodies)
-            await self._roll_up(batch)
+            sum_rows, hist_rows = self._roll_up(batch)
+            # One transaction, one lock acquisition, one commit for the whole
+            # batch — see Database.write_batch.
+            await self.db.awrite_batch([
+                (_INSERT, [_row(r) for r in batch]),
+                (_INSERT_BODY, bodies),
+                (SUM_UPSERT, sum_rows),
+                (HIST_UPSERT, hist_rows),
+            ])
             self.written += len(batch)
-            for r in batch:
-                log.debug("recorded request", extra={"data": {
-                    "id": r.id, "route": r.route, "model": r.model,
-                    "endpoint": r.endpoint_name, "ok": r.ok,
-                    "status": r.status, "tokens": r.total_tokens,
-                    "ttft_ms": r.ttft_ms, "latency_ms": r.latency_ms,
-                }})
+            if log.isEnabledFor(logging.DEBUG):
+                for r in batch:
+                    log.debug("recorded request", extra={"data": {
+                        "id": r.id, "route": r.route, "model": r.model,
+                        "endpoint": r.endpoint_name, "ok": r.ok,
+                        "status": r.status, "tokens": r.total_tokens,
+                        "ttft_ms": r.ttft_ms, "latency_ms": r.latency_ms,
+                    }})
         except Exception:
             log.exception("telemetry write failed",
                           extra={"data": {"batch": len(batch)}})
 
-    async def _roll_up(self, batch: list[RequestRecord]) -> None:
-        """Fold this batch into the hourly rollup tables (same additive UPSERTs
+    @staticmethod
+    def _roll_up(batch: list[RequestRecord]) -> tuple[list, list]:
+        """Fold this batch into hourly rollup rows (the same additive UPSERTs
         the backfill uses). Keeps dashboard queries O(buckets), not O(rows)."""
         items = [{
             "ts": r.ts, "endpoint_id": r.endpoint_id, "model": r.model,
@@ -187,34 +216,63 @@ class TelemetryWriter:
             "tokens_per_sec": r.tokens_per_sec,
             "endpoint_name": r.endpoint_name,
         } for r in batch]
-        sum_rows, hist_rows = build_rollup_rows(items)
-        if sum_rows:
-            await self.db.aexecutemany(SUM_UPSERT, sum_rows)
-        if hist_rows:
-            await self.db.aexecutemany(HIST_UPSERT, hist_rows)
+        return build_rollup_rows(items)
 
     async def prune(self, retention_days: int) -> int:
         """Delete raw rows past retention. Called periodically from the app.
 
         ``retention_days <= 0`` means "keep forever": nothing is deleted. The
         hourly rollup tables are never pruned regardless, so aggregate history
-        (dashboard charts) survives even when a finite raw retention is set."""
+        (dashboard charts) survives even when a finite raw retention is set.
+
+        Done in bounded chunks, with a yield between them. There is one write
+        connection behind one lock, so a single statement that runs for
+        seconds stalls every telemetry write for that long — and the old
+        orphan sweep (``id NOT IN (SELECT id FROM requests)``) was an
+        unindexed anti-join across the whole bodies table, once an hour,
+        holding that lock throughout. Chunking trades a slightly longer prune
+        for never blocking the hot path.
+        """
         if retention_days <= 0:
             self._last_prune = time.time()
             return 0
         cutoff = time.time() - retention_days * 86400
-        n = await self.db.aexecute("DELETE FROM requests WHERE ts < ?", (cutoff,))
-        await self.db.aexecute(
-            "DELETE FROM request_bodies WHERE id NOT IN (SELECT id FROM requests)"
-        )
-        await self.db.aexecute(
-            "DELETE FROM frontend_logs WHERE ts < ?", (cutoff,)
-        )
+        n = 0
+        while True:
+            doomed = await self.db.aquery(
+                "SELECT id FROM requests WHERE ts < ? LIMIT ?",
+                (cutoff, _PRUNE_CHUNK))
+            if not doomed:
+                break
+            ids = [r["id"] for r in doomed]
+            marks = ",".join("?" * len(ids))
+            # Bodies first: an interrupted prune then leaves rows whose body
+            # is gone, never bodies no query can reach.
+            await self.db.aexecute(
+                f"DELETE FROM request_bodies WHERE id IN ({marks})", ids)
+            await self.db.aexecute(
+                f"DELETE FROM requests WHERE id IN ({marks})", ids)
+            n += len(ids)
+            await asyncio.sleep(0)  # let queued writes through
+        while True:
+            removed = await self.db.aexecute(
+                "DELETE FROM frontend_logs WHERE id IN"
+                " (SELECT id FROM frontend_logs WHERE ts < ? LIMIT ?)",
+                (cutoff, _PRUNE_CHUNK))
+            if not removed:
+                break
+            await asyncio.sleep(0)
         if n:
             log.info("pruned telemetry", extra={"data": {
                 "rows": n, "retention_days": retention_days}})
         self._last_prune = time.time()
         return n
+
+
+# How long a client key stays counted as "active", and a hard ceiling so a
+# flood of distinct keys can't grow the registry without bound.
+_CLIENT_TTL = 3600.0
+_MAX_TRACKED_CLIENTS = 10_000
 
 
 class LiveTracker:
@@ -269,6 +327,24 @@ class LiveTracker:
     def sample(self) -> None:
         """Periodic sampler tick (keeps the series moving when idle)."""
         self._sample()
+        self._expire_clients()
+
+    def _expire_clients(self) -> None:
+        """Drop client keys nobody has used inside the reporting window.
+
+        ``clients`` is keyed by masked bearer token, so a relay open to the
+        internet grows one entry per distinct key seen, forever — and
+        ``active_clients`` walks all of them on every dashboard poll.
+        """
+        cutoff = time.time() - _CLIENT_TTL
+        if len(self.clients) > _MAX_TRACKED_CLIENTS or any(
+                ts <= cutoff for ts in self.clients.values()):
+            self.clients = {k: ts for k, ts in self.clients.items()
+                            if ts > cutoff}
+        if len(self.clients) > _MAX_TRACKED_CLIENTS:
+            # Still too many inside the window: keep the most recent.
+            newest = sorted(self.clients.items(), key=lambda kv: -kv[1])
+            self.clients = dict(newest[:_MAX_TRACKED_CLIENTS])
 
     def active_clients(self, window_s: float = 3600) -> int:
         cutoff = time.time() - window_s

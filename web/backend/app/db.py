@@ -318,6 +318,30 @@ class Database:
                 self._readers.append(conn)
         return conn
 
+    def write_batch(self, statements: list[tuple[str, list[tuple]]]) -> int:
+        """Apply several ``executemany`` statements in one transaction, under a
+        single acquisition of the write lock.
+
+        The telemetry writer's unit of work is four statements (rows, bodies,
+        and the two rollup upserts). Issued separately that is four lock
+        handoffs and four commits per batch, every one of them contending with
+        the retention prune and with any admin write. As one transaction it is
+        one of each, and a partial batch can no longer leave rollups
+        disagreeing with the rows they summarize.
+        """
+        total = 0
+        with self._lock:
+            try:
+                for sql, rows in statements:
+                    if not rows:
+                        continue
+                    total += self._conn.executemany(sql, rows).rowcount
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+        return total
+
     def query(self, sql: str, params: Iterable[Any] = ()) -> list[dict]:
         rows = self._reader().execute(sql, tuple(params)).fetchall()
         return [dict(r) for r in rows]
@@ -336,6 +360,11 @@ class Database:
 
     async def aexecutemany(self, sql: str, rows: list[tuple]) -> int:
         return await self._offload(self.executemany, sql, rows)
+
+    async def awrite_batch(
+        self, statements: list[tuple[str, list[tuple]]]
+    ) -> int:
+        return await self._offload(self.write_batch, statements)
 
     async def aquery(self, sql: str, params: Iterable[Any] = ()) -> list[dict]:
         return await self._offload(self.query, sql, params)

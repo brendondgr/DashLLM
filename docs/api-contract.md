@@ -198,7 +198,7 @@ In-flight requests are prepended with `state: "streaming"`, live
 | `GET /admin/stats/by-endpoint` | `{dimensions:["endpoint","requests","input","output","errors","share","endpoint_id"], source:[…]}` |
 | `GET /admin/stats/latency` | `{dimensions:["time","ttft_p50","ttft_p95","tps_p50"], source:[…]}` |
 | `GET /admin/stats/recent?limit=90` | `{rows:[RequestRow,…], counts:{all,streaming,done,error}}` |
-| `GET /admin/stats/live` | `{in_flight, max_concurrency, series:[[ts_ms,n],…]}` |
+| `GET /admin/stats/live` | `{in_flight, max_concurrency, active, waiting, queue_limit, series:[[ts_ms,n],…]}` |
 
 Percentiles in `summary` are exact (computed from raw rows) for spans up to
 ~24h and approximate (from stored histograms) for wider spans — see

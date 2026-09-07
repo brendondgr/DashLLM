@@ -46,6 +46,15 @@ _ROLLUP_UNITS = {"hour", "3hour", "day", "month"}
 # and approximately (from histograms) beyond it. 24h + a minute of slack.
 _EXACT_PCT_SPAN = 86400 + 60
 
+# ...but "exact" still has to be bounded. At a few hundred requests a second a
+# 24h window is millions of rows, and materializing them as dicts to sort in
+# Python is seconds of CPU *per dashboard poll* — with several screens polling,
+# that is the single most expensive thing relay does under load. Past this many
+# rows the scan is sampled by rowid stride, which SQLite evaluates straight off
+# the ts index. A uniform sample of 20k moves a p95 by well under a percent and
+# keeps the query flat as the table grows.
+_MAX_PCT_SAMPLES = 20_000
+
 
 def _percentile(values: list[float], pct: float) -> float | None:
     if not values:
@@ -120,6 +129,25 @@ class StatsService:
             clauses.append("model = ?")
             params.append(model)
         return " WHERE " + " AND ".join(clauses), params
+
+    async def _sample_stride(self, where: str, params: list) -> int:
+        """Rowid stride that keeps a raw percentile scan near
+        ``_MAX_PCT_SAMPLES`` rows. 1 means "read them all"."""
+        row = await self.db.aquery_one(
+            f"SELECT COUNT(*) AS n FROM requests{where}", params)
+        n = (row or {}).get("n") or 0
+        if n <= _MAX_PCT_SAMPLES:
+            return 1
+        return ceil(n / _MAX_PCT_SAMPLES)
+
+    @staticmethod
+    def _sampled(where: str, stride: int) -> str:
+        """Add the stride filter to a WHERE clause. ``rowid`` lives in the ts
+        index entry, so this narrows the scan without extra row lookups."""
+        if stride <= 1:
+            return where
+        clause = f"rowid % {stride} = 0"
+        return f"{where} AND {clause}" if where else f" WHERE {clause}"
 
     @staticmethod
     def _use_rollup(step: int) -> bool:
@@ -287,9 +315,10 @@ class StatsService:
 
         if exact:
             rwhere, rparams = self._filters(endpoint_id, model, start, end)
+            stride = await self._sample_stride(rwhere, rparams)
             samples = await self.db.aquery(
                 "SELECT ttft_ms, latency_ms, tokens_per_sec"
-                f" FROM requests{rwhere}", rparams)
+                f" FROM requests{self._sampled(rwhere, stride)}", rparams)
             ttfts = [r["ttft_ms"] for r in samples if r["ttft_ms"]]
             lats = [r["latency_ms"] for r in samples if r["latency_ms"]]
             tpss = [r["tokens_per_sec"] for r in samples if r["tokens_per_sec"]]
@@ -470,9 +499,13 @@ class StatsService:
         keys = self._fill(start, end, step, fmt)
         if (end - start) <= _EXACT_PCT_SPAN:
             where, params = self._filters(endpoint_id, model, start, end)
+            # Sampled uniformly across the window, so every bucket thins by
+            # the same factor and the shape of the series is preserved.
+            stride = await self._sample_stride(where, params)
             rows = await self.db.aquery(
                 f"SELECT strftime('{fmt}', ts, 'unixepoch', 'localtime') AS"
-                " bucket, ttft_ms, tokens_per_sec FROM requests" + where, params)
+                " bucket, ttft_ms, tokens_per_sec FROM requests"
+                + self._sampled(where, stride), params)
             grouped: dict[str, dict[str, list]] = {}
             for r in rows:
                 g = grouped.setdefault(r["bucket"], {"ttft": [], "tps": []})
