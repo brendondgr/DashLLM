@@ -10,8 +10,13 @@ Health state machine (active probes + passive request signals):
         probe ok / request ok
    ┌───────────────◀───────────────┐
 HEALTHY ──fails ≥ N──▶ DEGRADED ──fails keep coming──▶ FAILED (out of pool)
-   ▲                                                      │
+   ▲                                 (only while probes                │
+   │                                  are failing too)                 │
    └────────── M consecutive probe successes ◀────────────┘
+
+Both edges into and out of FAILED are probe-gated, and for the same reason:
+request outcomes say how the endpoint is *doing*, active probes say whether
+it is *there*. A busy server times out requests without being gone.
 """
 
 import json
@@ -62,6 +67,10 @@ class LiveState:
     health: str = "unknown"  # unknown|healthy|degraded|failed
     consecutive_fails: int = 0
     consecutive_probe_ok: int = 0
+    # Outcome of the most recent active probe, independent of request
+    # outcomes. None until one has run. See ``report_failure`` for why a
+    # passing probe outranks a run of failed requests.
+    last_probe_ok: bool | None = None
     ewma_latency_ms: float | None = None
     last_ok_ts: float | None = None
     model: str | None = None
@@ -507,6 +516,8 @@ class Router:
             return
         prev = st.health
         st.last_ok_ts = time.time()
+        if source == "probe":
+            st.last_probe_ok = True
         if latency_ms is not None:
             st.ewma_latency_ms = (
                 latency_ms if st.ewma_latency_ms is None
@@ -528,13 +539,31 @@ class Router:
                 "to": st.health, "source": source}})
 
     def report_failure(self, eid: str, error: str, source: str = "request") -> None:
+        """Feed a failure into the state machine.
+
+        Only the *prober* can take an endpoint all the way to FAILED. Request
+        failures degrade it and no more, for as long as probes keep passing.
+
+        That asymmetry is deliberate, and it mirrors the one on the recovery
+        side (a successful request never clears FAILED — only probes do).
+        Under congestion an overloaded but perfectly alive model server
+        returns a run of timeouts; three of those used to drop the only
+        endpoint out of the pool, at which point every subsequent request got
+        "no healthy upstream" and the relay was down while the server behind
+        it was merely busy. A server that is genuinely gone fails its probes
+        too, and goes FAILED on the next sweep — a few seconds later, with
+        evidence.
+        """
         st = self.state.get(eid)
         if st is None:
             return
         prev = st.health
         st.consecutive_fails += 1
         st.consecutive_probe_ok = 0
-        if st.consecutive_fails >= self.unhealthy_after:
+        if source == "probe":
+            st.last_probe_ok = False
+        enough = st.consecutive_fails >= self.unhealthy_after
+        if enough and st.last_probe_ok is not True:
             st.health = "failed"
         else:
             st.health = "degraded"
@@ -542,7 +571,7 @@ class Router:
         level("endpoint failure", extra={"data": {
             "endpoint": self.endpoints[eid]["name"], "error": error[:300],
             "fails": st.consecutive_fails, "from": prev, "to": st.health,
-            "source": source}})
+            "source": source, "last_probe_ok": st.last_probe_ok}})
 
     def set_models(self, eid: str, models: list[str]) -> None:
         """Record what a probe discovered, then narrow it to the allowlist.

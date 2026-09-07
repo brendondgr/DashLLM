@@ -108,7 +108,8 @@ failover may land on an endpoint running a different model.
         probe ok / request ok
    ┌───────────────◀───────────────┐
 HEALTHY ──fails ≥ N──▶ DEGRADED ──fails keep coming──▶ FAILED (out of pool)
-   ▲                                                      │
+   ▲                                 (only while probes                │
+   │                                  are failing too)                 │
    └────────── M consecutive probe successes ◀────────────┘
 ```
 
@@ -116,10 +117,20 @@ Active probes run every `RELAY_PROBE_INTERVAL` (default 15s), and real
 request outcomes feed the same signals. `N` is `RELAY_UNHEALTHY_AFTER`
 (default 3) and `M` is `RELAY_RECOVER_AFTER` (default 2).
 
+Both edges touching `FAILED` are probe-gated, and symmetrically so.
+
 Recovery out of `FAILED` requires **probe** successes specifically — a
 successful request alone does not clear it, which avoids flapping when one
-lucky request slips through a mostly-dead endpoint. Success also feeds an
-EWMA latency (`0.3 * new + 0.7 * old`).
+lucky request slips through a mostly-dead endpoint. Entry into `FAILED`
+likewise needs the prober's agreement: while the last probe passed, a run of
+failed *requests* takes the endpoint only as far as `DEGRADED`, so it stays
+in the pool. Under congestion an overloaded but perfectly alive server
+returns timeouts, and treating those as death removed the only endpoint and
+turned a busy relay into a relay that answered nothing but
+`no healthy upstream`. A server that is really gone fails its probes too, and
+is out within one `RELAY_PROBE_INTERVAL`.
+
+Success also feeds an EWMA latency (`0.3 * new + 0.7 * old`).
 
 ## Streaming and failover
 
