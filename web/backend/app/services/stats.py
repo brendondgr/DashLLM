@@ -64,9 +64,14 @@ class StatsService:
         self.live = live
 
     # ---- window helpers ---------------------------------------------------
-    def _range(self, window: str | None, from_ts: float | None,
-               to_ts: float | None) -> tuple[float, float, int, str]:
-        """-> (start, end, bucket_seconds, strftime_fmt)"""
+    async def _range(self, window: str | None, from_ts: float | None,
+                     to_ts: float | None) -> tuple[float, float, int, str]:
+        """-> (start, end, bucket_seconds, strftime_fmt)
+
+        Async because the "all" window has to ask the DB where history
+        starts, and a synchronous sqlite call here blocked the event loop for
+        every other request in flight.
+        """
         now = time.time()
         if from_ts is not None:
             start = from_ts
@@ -74,7 +79,7 @@ class StatsService:
             return start, end, 3600, _HOUR_FMT
         w = window or "24h"
         if w == "all":
-            row = self.db.query_one("SELECT MIN(ts) AS t FROM requests")
+            row = await self.db.aquery_one("SELECT MIN(ts) AS t FROM requests")
             start = (row["t"] if row and row["t"] else now - 86400)
             return start, now, 3600, _HOUR_FMT
         span = _WINDOWS.get(w, 86400)
@@ -131,16 +136,17 @@ class StatsService:
         return keys
 
     # ---- combined-chart timeseries bucketing ------------------------------
-    def _ts_range(self, window: str | None, detail: str | None,
-                  from_ts: float | None,
-                  to_ts: float | None) -> tuple[float, float, str]:
-        """-> (start, end, unit) for the volume / tokens timeseries."""
+    async def _ts_range(self, window: str | None, detail: str | None,
+                        from_ts: float | None,
+                        to_ts: float | None) -> tuple[float, float, str]:
+        """-> (start, end, unit) for the volume / tokens timeseries. Async for
+        the same reason as :meth:`_range`."""
         now = time.time()
         if from_ts is not None:
             return from_ts, (to_ts or now), "hour"
         w = window or "24h"
         if w == "all":
-            row = self.db.query_one("SELECT MIN(ts) AS t FROM requests")
+            row = await self.db.aquery_one("SELECT MIN(ts) AS t FROM requests")
             start = row["t"] if row and row["t"] else now - 86400
             return start, now, "day"
         d = detail if detail in ("summary", "detailed") else "summary"
@@ -253,7 +259,7 @@ class StatsService:
     # ---- endpoints ---------------------------------------------------------
     async def summary(self, window: str | None, from_ts=None, to_ts=None,
                       endpoint_id=None, model=None) -> dict:
-        start, end, step, _ = self._range(window, from_ts, to_ts)
+        start, end, step, _ = await self._range(window, from_ts, to_ts)
         exact = (end - start) <= _EXACT_PCT_SPAN
 
         if self._use_rollup(step):
@@ -317,7 +323,7 @@ class StatsService:
 
     async def volume(self, window, from_ts=None, to_ts=None,
                      endpoint_id=None, model=None, detail="summary") -> dict:
-        start, end, unit = self._ts_range(window, detail, from_ts, to_ts)
+        start, end, unit = await self._ts_range(window, detail, from_ts, to_ts)
         buckets = await self._ts_agg(
             unit, start, end, endpoint_id, model,
             "SUM(n) AS v0, SUM(errors) AS v1",
@@ -330,7 +336,7 @@ class StatsService:
     async def tokens_timeseries(self, window, from_ts=None, to_ts=None,
                                 endpoint_id=None, model=None,
                                 detail="summary") -> dict:
-        start, end, unit = self._ts_range(window, detail, from_ts, to_ts)
+        start, end, unit = await self._ts_range(window, detail, from_ts, to_ts)
         buckets = await self._ts_agg(
             unit, start, end, endpoint_id, model,
             "SUM(prompt_tokens) AS v0, SUM(completion_tokens) AS v1",
@@ -343,7 +349,7 @@ class StatsService:
 
     async def tokens_by_hour(self, window, from_ts=None, to_ts=None,
                              endpoint_id=None, model=None) -> dict:
-        start, end, step, _ = self._range(window or "30d", from_ts, to_ts)
+        start, end, step, _ = await self._range(window or "30d", from_ts, to_ts)
         if self._use_rollup(step):
             where, params = self._roll_where(endpoint_id, model, start, end)
             rows = await self.db.aquery(
@@ -368,7 +374,7 @@ class StatsService:
 
     async def tokens_by_day(self, window, from_ts=None, to_ts=None,
                             endpoint_id=None, model=None) -> dict:
-        start, end, step, _ = self._range(window or "7d", from_ts, to_ts)
+        start, end, step, _ = await self._range(window or "7d", from_ts, to_ts)
         if self._use_rollup(step):
             where, params = self._roll_where(endpoint_id, model, start, end)
             rows = await self.db.aquery(
@@ -394,7 +400,7 @@ class StatsService:
 
     async def by_model(self, window, from_ts=None, to_ts=None,
                        endpoint_id=None, model=None) -> dict:
-        start, end, step, _ = self._range(window, from_ts, to_ts)
+        start, end, step, _ = await self._range(window, from_ts, to_ts)
         if self._use_rollup(step):
             where, params = self._roll_where(endpoint_id, model, start, end)
             rows = await self.db.aquery(
@@ -428,7 +434,7 @@ class StatsService:
 
     async def by_endpoint(self, window, from_ts=None, to_ts=None,
                           endpoint_id=None, model=None) -> dict:
-        start, end, step, _ = self._range(window, from_ts, to_ts)
+        start, end, step, _ = await self._range(window, from_ts, to_ts)
         if self._use_rollup(step):
             where, params = self._roll_where(endpoint_id, model, start, end)
             rows = await self.db.aquery(
@@ -460,7 +466,7 @@ class StatsService:
 
     async def latency(self, window, from_ts=None, to_ts=None,
                       endpoint_id=None, model=None) -> dict:
-        start, end, step, fmt = self._range(window, from_ts, to_ts)
+        start, end, step, fmt = await self._range(window, from_ts, to_ts)
         keys = self._fill(start, end, step, fmt)
         if (end - start) <= _EXACT_PCT_SPAN:
             where, params = self._filters(endpoint_id, model, start, end)

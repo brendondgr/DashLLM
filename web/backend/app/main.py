@@ -146,7 +146,7 @@ def create_app(cfg: Config | None = None,
     app = FastAPI(title="relay", version=__version__, lifespan=lifespan)
     app.state.cfg = cfg
     app.state.opencode = oc_cfg or opencode_config
-    app.state.db = Database(cfg.db_path)
+    app.state.db = Database(cfg.db_path, threads=cfg.db_threads)
     app.state.settings = SettingsStore(app.state.db, boot_port=cfg.port)
     app.state.telemetry = TelemetryWriter(app.state.db)
     app.state.live = LiveTracker()

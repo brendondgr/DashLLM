@@ -3,9 +3,21 @@ Postgres-compatible (TEXT ids, REAL unix-seconds timestamps, no SQLite-only
 column types) so a future migration is a driver swap, not a redesign.
 
 Concurrency model: WAL mode; one long-lived write connection guarded by a
-lock (all mutations funnel through the telemetry writer or admin routes),
-short-lived read connections per query so dashboard polling never contends
-with the hot path. Async callers use the ``a*`` wrappers (thread offload).
+lock (all mutations funnel through the telemetry writer or admin routes), and
+one long-lived read-only connection *per reader thread* so dashboard polling
+never contends with the hot path. Async callers use the ``a*`` wrappers.
+
+Two details there are load-bearing under concurrency:
+
+- **Readers are cached per thread, not opened per query.** Every ``query()``
+  used to ``sqlite3.connect()`` and close again; at a few hundred requests a
+  second that is an open/mmap/close of the WAL index per dashboard poll, and
+  it showed up as latency on the hot path because it burned the same threads
+  telemetry writes need.
+- **The offload target is this module's own pool**, not ``asyncio.to_thread``.
+  The default executor is shared with everything else in the process and is
+  only ``min(32, cpu+4)`` wide, so a slow stats query could starve the
+  telemetry writer — and vice versa.
 """
 
 import asyncio
@@ -13,6 +25,7 @@ import sqlite3
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -154,16 +167,31 @@ CREATE TABLE IF NOT EXISTS frontend_logs (
 """
 
 
+# Long enough to ride out a checkpoint or a batched write without surfacing
+# "database is locked" to a caller, short enough to fail loudly if something
+# is genuinely wedged.
+_BUSY_TIMEOUT_MS = 10_000
+
+
 class Database:
-    def __init__(self, path: Path | str):
+    def __init__(self, path: Path | str, threads: int = 8):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
+        self._closed = False
+        # Reader connections, one per thread that ever reads, kept alive for
+        # the life of the process and closed together in close().
+        self._local = threading.local()
+        self._readers: list[sqlite3.Connection] = []
+        self._readers_lock = threading.Lock()
+        self._pool = ThreadPoolExecutor(
+            max_workers=max(2, threads), thread_name_prefix="relay-db")
         self._conn = sqlite3.connect(self.path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA synchronous=NORMAL")
+            self._conn.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
             self._conn.executescript(SCHEMA)
             self._migrate()
             self._conn.commit()
@@ -276,37 +304,58 @@ class Database:
             self._conn.commit()
             return cur.rowcount
 
-    def query(self, sql: str, params: Iterable[Any] = ()) -> list[dict]:
-        # Short-lived read-only connection: WAL readers don't block the writer.
-        conn = sqlite3.connect(
-            f"file:{self.path}?mode=ro", uri=True, check_same_thread=False
-        )
-        try:
+    def _reader(self) -> sqlite3.Connection:
+        """This thread's read-only connection, opened once. WAL readers never
+        block the writer, so every thread can hold one indefinitely."""
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = sqlite3.connect(
+                f"file:{self.path}?mode=ro", uri=True, check_same_thread=False)
             conn.row_factory = sqlite3.Row
-            rows = conn.execute(sql, tuple(params)).fetchall()
-            return [dict(r) for r in rows]
-        finally:
-            conn.close()
+            conn.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
+            self._local.conn = conn
+            with self._readers_lock:
+                self._readers.append(conn)
+        return conn
+
+    def query(self, sql: str, params: Iterable[Any] = ()) -> list[dict]:
+        rows = self._reader().execute(sql, tuple(params)).fetchall()
+        return [dict(r) for r in rows]
 
     def query_one(self, sql: str, params: Iterable[Any] = ()) -> dict | None:
         rows = self.query(sql, params)
         return rows[0] if rows else None
 
     # -- async wrappers ------------------------------------------------
+    async def _offload(self, fn, *args):
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(self._pool, fn, *args)
+
     async def aexecute(self, sql: str, params: Iterable[Any] = ()) -> int:
-        return await asyncio.to_thread(self.execute, sql, params)
+        return await self._offload(self.execute, sql, params)
 
     async def aexecutemany(self, sql: str, rows: list[tuple]) -> int:
-        return await asyncio.to_thread(self.executemany, sql, rows)
+        return await self._offload(self.executemany, sql, rows)
 
     async def aquery(self, sql: str, params: Iterable[Any] = ()) -> list[dict]:
-        return await asyncio.to_thread(self.query, sql, params)
+        return await self._offload(self.query, sql, params)
 
     async def aquery_one(
         self, sql: str, params: Iterable[Any] = ()
     ) -> dict | None:
-        return await asyncio.to_thread(self.query_one, sql, params)
+        return await self._offload(self.query_one, sql, params)
 
     def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._pool.shutdown(wait=True)
+        with self._readers_lock:
+            readers, self._readers = self._readers, []
+        for conn in readers:
+            try:
+                conn.close()
+            except sqlite3.Error:  # pragma: no cover - best-effort teardown
+                pass
         with self._lock:
             self._conn.close()
