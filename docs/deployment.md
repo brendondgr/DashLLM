@@ -41,13 +41,46 @@ exists (`app/config.py` points at it explicitly), and so is the environment.
 | `RELAY_LOG_LEVEL` | `INFO` | log verbosity |
 | `RELAY_PROBE_INTERVAL` | `15` | seconds between active health probes |
 | `RELAY_PROBE_TIMEOUT` | `5` | probe timeout |
-| `RELAY_UNHEALTHY_AFTER` | `3` | consecutive failures → `failed` (out of rotation) |
+| `RELAY_UNHEALTHY_AFTER` | `3` | consecutive failures → `failed` (out of rotation); request failures alone only reach `degraded` while probes still pass |
 | `RELAY_RECOVER_AFTER` | `2` | consecutive probe successes → `healthy` |
 | `RELAY_CONNECT_TIMEOUT` | `10` | upstream connect timeout |
 | `RELAY_READ_TIMEOUT` | `600` | upstream read timeout (long, for slow streams) |
 | `RELAY_WRITE_TIMEOUT` | `60` | upstream write timeout |
-| `RELAY_MAX_CONCURRENCY` | `18` | in-flight proxy slots; also the live gauge's ceiling |
+| `RELAY_MAX_CONCURRENCY` | `256` | requests at the upstream at once; also the live gauge's ceiling |
+| `RELAY_QUEUE_LIMIT` | `2048` | requests allowed to wait for a slot before relay sheds with 429 |
+| `RELAY_QUEUE_TIMEOUT` | `30` | seconds a queued request may wait before relay answers 429 itself (`0` waits forever) |
+| `RELAY_MAX_BODY_BYTES` | `8388608` | inbound request body cap; larger gets 413 |
+| `RELAY_POOL_CONNECTIONS` | derived | upstream HTTP pool size; `0` derives `max_concurrency * 2 + 32` |
+| `RELAY_POOL_KEEPALIVE` | derived | idle upstream connections kept; `0` derives `max_concurrency / 2` |
+| `RELAY_POOL_TIMEOUT` | `10` | seconds to wait for a pool slot before reporting local saturation |
+| `RELAY_DB_THREADS` | `8` | threads serving SQLite (its own pool, not asyncio's default executor) |
 | `RELAY_FRONTEND_DIST` | `web/frontend/dist` | built dashboard to serve |
+
+### Sizing under load
+
+`RELAY_MAX_CONCURRENCY` and `RELAY_QUEUE_LIMIT` do different jobs and should
+not be tuned together:
+
+- **`max_concurrency` protects the upstream.** It is how many requests reach
+  the model server simultaneously. More is not better past the server's own
+  capacity — measured against a stub with 0.5 s service time, throughput
+  peaked at 256 and then *fell*: 358 rps at 256, 137 rps at 512, 83 rps at
+  1024, with p99 latency rising from 4 s to 39 s. Past the knee you are
+  paying queueing delay inside the model server instead of inside relay,
+  where it is invisible and unbounded. Start at the default and lower it if
+  your upstream is a single-process server.
+- **`queue_limit` sets how many clients relay can hold.** `max_concurrency +
+  queue_limit` is the number of live requests before relay starts refusing;
+  the defaults carry ~2300. Requests over the limit get `429` with a
+  `Retry-After` rather than a wait nobody is still around for.
+
+Watch `active` and `waiting` on `GET /admin/stats/live`: `waiting` climbing
+while `active` sits at `max_concurrency` means the upstream is the
+bottleneck, and 429s mean relay has started shedding.
+
+`./scripts/stress.sh` runs this end to end against a throwaway relay and a
+stub upstream (`BASELINE=1` runs the same load with relay out of the path, so
+the numbers have something to be compared against).
 
 The OpenCode side is configured under its own prefix, and is equally optional:
 

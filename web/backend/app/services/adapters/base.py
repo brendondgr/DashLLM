@@ -50,6 +50,35 @@ class RetryableUpstreamError(Exception):
         self.status = status
 
 
+class UpstreamSaturated(RetryableUpstreamError):
+    """This attempt failed because *relay* ran out of local capacity — the
+    shared httpx connection pool had no slot free — not because the upstream
+    misbehaved.
+
+    The distinction is load-bearing. A ``PoolTimeout`` raised while 300
+    requests are in flight says nothing about the model server, but the
+    health state machine cannot tell the difference: three of them in a row
+    marked a perfectly healthy endpoint FAILED and took the whole pool down
+    with it. Failing over is equally pointless — every endpoint shares the
+    same pool — so the dispatch layer answers 503 + Retry-After instead of
+    burning attempts and health credit.
+    """
+
+
+def classify_httpx_error(e: httpx.HTTPError) -> RetryableUpstreamError:
+    """Map an httpx exception to the right retryable class.
+
+    ``PoolTimeout`` is the local-saturation signal; everything else
+    (connect/read timeouts, resets, protocol errors) is genuinely the
+    upstream's problem and should feed the health state machine.
+    """
+    message = f"{type(e).__name__}: {e}"
+    if isinstance(e, httpx.PoolTimeout):
+        return UpstreamSaturated(
+            "relay connection pool exhausted: " + message, status=503)
+    return RetryableUpstreamError(message)
+
+
 class StaleModelOverride(Exception):
     """Upstream rejected the endpoint's pinned model_override as unknown — the
     model on that port was swapped out. Signals the dispatch layer to clear

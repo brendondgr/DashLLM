@@ -65,5 +65,13 @@ async def recent(request: Request, limit: int = 90):
 
 @router.get("/live")
 async def live(request: Request):
-    return request.app.state.live.snapshot(
-        request.app.state.cfg.max_concurrency)
+    """In-flight requests plus the admission gate's own view.
+
+    ``in_flight`` counts everything relay is carrying (including requests
+    still waiting for a slot); ``active``/``waiting`` split that into what is
+    actually at an upstream versus queued, which is the difference between
+    "the model server is slow" and "relay is about to start shedding".
+    """
+    gate = request.app.state.proxy.gate
+    return {**request.app.state.live.snapshot(gate.max_concurrency),
+            **gate.snapshot()}

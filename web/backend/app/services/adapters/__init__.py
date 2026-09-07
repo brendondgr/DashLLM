@@ -10,6 +10,8 @@ from app.services.adapters.base import (
     RetryableUpstreamError,
     StaleModelOverride,
     UpstreamAdapter,
+    UpstreamSaturated,
+    classify_httpx_error,
 )
 from app.services.adapters.opencode import OpenCodeAdapter
 from app.services.adapters.passthrough import PassthroughAdapter
@@ -38,5 +40,7 @@ __all__ = [
     "RetryableUpstreamError",
     "StaleModelOverride",
     "UpstreamAdapter",
+    "UpstreamSaturated",
+    "classify_httpx_error",
     "get_adapter",
 ]

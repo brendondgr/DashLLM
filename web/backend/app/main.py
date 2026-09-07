@@ -58,19 +58,38 @@ async def _housekeeping(app: FastAPI) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     cfg = app.state.cfg
+    # The pool has to be at least as wide as the admission gate, plus room for
+    # the extra calls a single logical request makes (OpenCode does session
+    # create -> message -> delete). A pool narrower than the gate turns relay's
+    # own saturation into PoolTimeouts that the health state machine reads as
+    # a broken endpoint — see UpstreamSaturated.
+    pool_max = cfg.pool_connections or (cfg.max_concurrency * 2 + 32)
+    keepalive = cfg.pool_keepalive or max(32, cfg.max_concurrency // 2)
     app.state.http = httpx.AsyncClient(
         timeout=httpx.Timeout(
             connect=cfg.connect_timeout, read=cfg.read_timeout,
-            write=cfg.write_timeout, pool=30.0),
-        limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
+            write=cfg.write_timeout, pool=cfg.pool_timeout),
+        limits=httpx.Limits(max_connections=pool_max,
+                            max_keepalive_connections=keepalive),
+    )
+    # Probes get their own small pool. Sharing the proxy's is how a burst of
+    # traffic used to fail the health check for the very endpoint serving it:
+    # probes queued behind proxied requests, timed out, and three of those in
+    # a row dropped a healthy endpoint out of rotation. Health has to be
+    # measurable precisely when relay is busiest.
+    app.state.probe_http = httpx.AsyncClient(
+        timeout=httpx.Timeout(cfg.probe_timeout, pool=cfg.probe_timeout),
+        limits=httpx.Limits(max_connections=16, max_keepalive_connections=8),
     )
     app.state.prober = HealthProber(
-        app.state.router, app.state.http,
+        app.state.router, app.state.probe_http,
         interval=cfg.probe_interval, timeout=cfg.probe_timeout)
     app.state.proxy = ProxyService(
         app.state.http, app.state.router, app.state.telemetry,
         app.state.live, app.state.settings,
-        max_concurrency=cfg.max_concurrency)
+        max_concurrency=cfg.max_concurrency,
+        queue_limit=cfg.queue_limit, queue_timeout=cfg.queue_timeout,
+        max_body_bytes=cfg.max_body_bytes)
     app.state.tunnels = TunnelManager(app.state.db, app.state.http)
     app.state.tunnel_sessions = TunnelSessionManager()
     await app.state.telemetry.start()
@@ -87,7 +106,10 @@ async def lifespan(app: FastAPI):
     task = asyncio.create_task(_housekeeping(app), name="housekeeping")
     log.info("relay started", extra={"data": {
         "version": __version__, "port": app.state.cfg.port,
-        "db": str(app.state.cfg.db_path)}})
+        "db": str(app.state.cfg.db_path),
+        "max_concurrency": cfg.max_concurrency,
+        "queue_limit": cfg.queue_limit,
+        "pool_connections": pool_max}})
     # relay has no auth layer, and an agent endpoint runs shell commands and
     # edits files on its host by design. On a non-loopback bind that makes the
     # port a remote shell for anyone who can reach it. Loud, once, at boot —
@@ -111,6 +133,7 @@ async def lifespan(app: FastAPI):
         await app.state.prober.stop()
         await app.state.telemetry.stop()
         await app.state.http.aclose()
+        await app.state.probe_http.aclose()
         app.state.db.close()
         log.info("relay stopped")
 
@@ -123,7 +146,7 @@ def create_app(cfg: Config | None = None,
     app = FastAPI(title="relay", version=__version__, lifespan=lifespan)
     app.state.cfg = cfg
     app.state.opencode = oc_cfg or opencode_config
-    app.state.db = Database(cfg.db_path)
+    app.state.db = Database(cfg.db_path, threads=cfg.db_threads)
     app.state.settings = SettingsStore(app.state.db, boot_port=cfg.port)
     app.state.telemetry = TelemetryWriter(app.state.db)
     app.state.live = LiveTracker()

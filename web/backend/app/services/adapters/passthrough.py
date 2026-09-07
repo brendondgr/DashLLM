@@ -18,6 +18,7 @@ from app.services.adapters.base import (
     RetryableUpstreamError,
     StaleModelOverride,
     UpstreamAdapter,
+    classify_httpx_error,
 )
 from app.services.telemetry import RequestRecord
 
@@ -78,7 +79,7 @@ class PassthroughAdapter(UpstreamAdapter):
         try:
             resp = await proxy.http.send(upstream_req, stream=True)
         except httpx.HTTPError as e:
-            raise RetryableUpstreamError(f"{type(e).__name__}: {e}") from e
+            raise classify_httpx_error(e) from e
 
         if resp.status_code >= 500:
             text = (await resp.aread())[:1000]
