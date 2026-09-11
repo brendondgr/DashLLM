@@ -156,7 +156,11 @@ backend changes and `npm run build` + `relay restart` picks up frontend ones.
   `.env`, because systemd can't expand variables in `WorkingDirectory=` and
   because a value baked into the unit is silently reverted the next time
   `install-systemd.sh` runs — which is exactly how a local `--host 0.0.0.0`
-  edit got lost once.
+  edit got lost once. The units are also **templates**: every repo path in them
+  is written `@REPO_ROOT@` and substituted by `install-systemd.sh`, which knows
+  where this clone lives. Writing a literal path into a unit gives you one that
+  only works for a clone at that exact location and dies at `ExecStart` with
+  nothing useful in the journal for anyone else.
 - **`uv` exits 143 on SIGTERM**, so `relay.service` needs
   `SuccessExitStatus=143` or a clean stop parks the unit in `failed`.
 - **Never write to the repo's `.env`.** It is the user's real configuration and

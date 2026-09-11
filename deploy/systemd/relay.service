@@ -1,3 +1,7 @@
+# TEMPLATE. @REPO_ROOT@ is substituted with this clone's absolute path by
+# scripts/install-systemd.sh. Do not hardcode a path here: the installed unit
+# must follow wherever the repo actually lives, and a value baked into this
+# file is silently reverted the next time the installer runs.
 [Unit]
 Description=DashLLM relay - OpenAI-compatible LLM proxy + dashboard
 # relay comes up on boot and serves the dashboard + proxy. It does NOT connect
@@ -15,12 +19,12 @@ Before=opencode.service
 
 [Service]
 Type=simple
-WorkingDirectory=%h/Tools/DashLLM/web/backend
+WorkingDirectory=@REPO_ROOT@/web/backend
 # The wrapper sources .env and takes RELAY_HOST / RELAY_PORT from it, so the
 # bind address is configuration rather than a value baked into this file that
 # a re-install would silently revert. uv resolves the project venv from the
 # pyproject.toml in WorkingDirectory.
-ExecStart=%h/Tools/DashLLM/scripts/relay-serve.sh
+ExecStart=@REPO_ROOT@/scripts/relay-serve.sh
 Restart=always
 RestartSec=5
 # `uv` traps SIGTERM and exits 143 (128+15) rather than dying from the signal,
@@ -30,8 +34,8 @@ SuccessExitStatus=143
 Environment=PYTHONUNBUFFERED=1
 # Persist runtime state (registered endpoints, telemetry) under the repo.
 # .env wins over these if it sets them.
-Environment=RELAY_DB_PATH=%h/Tools/DashLLM/web/backend/data/relay.db
-Environment=RELAY_LOG_DIR=%h/Tools/DashLLM/web/backend/logs
+Environment=RELAY_DB_PATH=@REPO_ROOT@/web/backend/data/relay.db
+Environment=RELAY_LOG_DIR=@REPO_ROOT@/web/backend/logs
 
 [Install]
 WantedBy=default.target

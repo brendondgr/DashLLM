@@ -5,6 +5,31 @@ between your clients and one or more model servers (llama.cpp, vLLM, ollama,
 any OpenAI-compatible endpoint), exposes its own drop-in `/v1` endpoint, and
 records per-request telemetry rendered as Apache ECharts visualizations.
 
+![Dashboard: stat tiles for requests, tokens in and out, tokens per second, p95 latency and error rate, above per-hour request volume, live concurrency against the cap, and a per-endpoint breakdown.](docs/assets/Dashboard.png)
+
+*318.5k requests over a two-month range. Volume and tokens per hour on the left,
+live concurrency against the 256 cap on the right, per-endpoint totals below it.*
+
+**Status:** active. Self-hosted and in daily use since July 2026 — this is the
+proxy my own research traffic actually goes through, not a demonstration of one.
+
+## Why this exists
+
+Three problems, in the order they turned up. Running models locally, there was
+no way to see what any of it cost: no time-to-first-token, no tokens per second,
+no record of which prompts were slow or which ones failed. Then there were
+several servers, on different machines and different ports, and every client
+needed rewiring whenever one moved or died. Then OpenCode, which is an agent
+server that does not speak the OpenAI protocol at all.
+
+relay is the one place all three are handled. Clients get a stable `/v1` that
+outlives whatever is behind it, routing is a live registry rather than a config
+file, and every request that passes through leaves a row behind. The dashboard
+is the part I actually use — it is how I find out that a change made generation
+slower, which I could not see before.
+
+## What it does
+
 - **Proxy** — streaming SSE passthrough with TTFT and token-usage capture,
   multi-endpoint registry, hot-swap, health detection, priority failover, and
   model-alias routing that pins a request to a named server.
@@ -17,6 +42,17 @@ records per-request telemetry rendered as Apache ECharts visualizations.
   addressable. See [docs/opencode.md](docs/opencode.md).
 - **Dashboard** — Astro + React + ECharts, fed by an ECharts-shaped stats API
   (`dimensions`/`source` payloads) backed by hourly rollups.
+
+![Requests screen: a live table of calls with time, status, model and endpoint, tokens in and out, tokens per second, and end-to-end duration.](docs/assets/ModelCalls.png)
+
+*Every call as it lands. Each row expands to the prompt and completion relay
+stored for it, which is the part that makes a slow generation diagnosable after
+the fact rather than during it.*
+
+![Endpoints screen: four registered vLLM endpoints with health dots, URLs, model names and average latency, one marked active.](docs/assets/ServerEndpoints.png)
+
+*Four model servers registered. Requests route to the active one; hot-swapping
+drains in-flight requests before switching, so nothing in progress is dropped.*
 
 ## Quickstart
 
@@ -92,9 +128,9 @@ root/
 │       │   └── hooks/       # usePoll
 │       ├── astro.config.mjs
 │       └── package.json
-├── tests/backend/           # pytest suite (149 tests)
-├── utils/                   # seed_telemetry.py
-├── scripts/                 # dev.sh, relay, opencode-auth.sh, install-systemd.sh
+├── tests/backend/           # pytest suite (163 tests, fake upstreams)
+├── utils/                   # seed_telemetry.py, stub_upstream.py, stresstest.py
+├── scripts/                 # dev/launch wrappers, systemd install, stress + live checks
 └── deploy/systemd/          # relay.service + opencode.service (user units)
 ```
 
@@ -125,6 +161,7 @@ Against live model servers:
 | [opencode.md](docs/opencode.md) | Fronting an OpenCode agent server: setup, the free-model policy, gotchas |
 | [frontend.md](docs/frontend.md) | Component map, design tokens, chart conventions |
 | [deployment.md](docs/deployment.md) | Single-process production, env vars, systemd, security posture |
+| [plans/](docs/plans/) | Design records from before the OpenCode work shipped. Historical — kept as written, not updated |
 
 `CLAUDE.md` holds working conventions for agents (and humans) editing this
 repo.

@@ -1,3 +1,7 @@
+# TEMPLATE. @REPO_ROOT@ is substituted with this clone's absolute path by
+# scripts/install-systemd.sh. Do not hardcode a path here: the installed unit
+# must follow wherever the repo actually lives, and a value baked into this
+# file is silently reverted the next time the installer runs.
 [Unit]
 Description=OpenCode agent server (relay upstream)
 # PartOf makes systemd propagate relay's stop/restart down to this unit, and
@@ -13,7 +17,7 @@ Type=simple
 # Config (port, project directory, credentials, provider keys) is read from
 # .env by the wrapper — systemd cannot expand variables in WorkingDirectory=
 # and `opencode` is not on its default PATH.
-ExecStart=%h/Tools/DashLLM/scripts/opencode-serve.sh
+ExecStart=@REPO_ROOT@/scripts/opencode-serve.sh
 # on-failure, not always: the wrapper exits 0 when OPENCODE_ENABLED=0, and
 # Restart=always would treat that deliberate no-op as a crash and respawn it
 # every 5s forever. A genuine crash is still restarted.

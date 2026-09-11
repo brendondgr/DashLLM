@@ -2,6 +2,7 @@
 name = "relay-backend"
 version = "0.4.2"
 description = "OpenAI-compatible LLM proxy with multi-endpoint routing, SSH tunnels, telemetry, and an ECharts-shaped stats API"
+license = "MIT"
 requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.115",

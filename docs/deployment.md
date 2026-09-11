@@ -108,9 +108,12 @@ boot. Install with:
 ./scripts/install-systemd.sh
 ```
 
-Pass `--no-start` to install and enable without starting. The script copies
-`deploy/systemd/relay.service` into `~/.config/systemd/user/`, enables user
-lingering (so it starts at boot before login), frees `:4000` if a manual relay
+Pass `--no-start` to install and enable without starting. The units under
+`deploy/systemd/` are **templates**: the script substitutes `@REPO_ROOT@` with
+this clone's absolute path as it writes them into `~/.config/systemd/user/`, so
+the installed units follow wherever the repo actually lives. Edit the templates,
+not the installed copies — a re-install overwrites the latter. The script also
+enables user lingering (so it starts at boot before login), frees `:4000` if a manual relay
 is holding it, and removes the obsolete `vllm-tunnel-skynet.service` if an
 earlier install left one behind.
 

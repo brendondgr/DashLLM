@@ -21,11 +21,18 @@ START=1
 
 UNIT_DIR="$HOME/.config/systemd/user"
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/../deploy/systemd" && pwd)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-echo "installing units into $UNIT_DIR"
+echo "installing units into $UNIT_DIR (repo root: $REPO_ROOT)"
 mkdir -p "$UNIT_DIR"
-install -m 644 "$SRC/relay.service" "$UNIT_DIR/"
-install -m 644 "$SRC/opencode.service" "$UNIT_DIR/"
+# The checked-in units are templates: @REPO_ROOT@ is substituted with this
+# clone's absolute path. Installing them verbatim would only ever work for a
+# clone at one hardcoded location, and the failure is a unit that dies at
+# ExecStart with nothing useful in the journal.
+for unit in relay.service opencode.service; do
+  sed "s|@REPO_ROOT@|$REPO_ROOT|g" "$SRC/$unit" > "$UNIT_DIR/$unit"
+  chmod 644 "$UNIT_DIR/$unit"
+done
 
 # Keep the `relay` wrapper on PATH in step with the repo copy — it now drives
 # both units, so a stale one would silently control only half of them.

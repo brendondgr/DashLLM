@@ -1,0 +1,60 @@
+# repo-audit profile. Regenerate/revalidate before any re-audit:
+#   python3 <skill>/scripts/audit_structure.py . --detect --compare repo-profile.yaml
+repo:
+  name: DashLLM
+  archetype: web-app
+  secondary: service
+  one_liner: "An OpenAI-compatible proxy that routes local and agent model servers behind one URL and records what every request cost in latency and tokens."
+  status: active
+  status_honest_note: "Built from 2026-07-03, in daily self-hosted use. 42 commits; last 2026-09-07."
+  visibility: private          # ← blocker for purpose: portfolio
+
+purpose: portfolio
+reader: hiring-manager
+role_family: swe
+
+ecosystem:
+  primary: python
+  package_manager: uv
+  lockfile: web/backend/uv.lock
+  layout: flat                 # web/backend + web/frontend; app/ package under backend
+  min_version: "3.12"
+  secondary_ecosystem: js-ts   # web/frontend, npm + package-lock.json
+
+entrypoints:
+  setup: null                  # none needed; launch.sh is zero-config
+  run: "./launch.sh"
+  test: "cd web/backend && uv run pytest"
+  verified: partial            # tests + frontend build verified 2026-09-10;
+                               # launch.sh not run in a clean container (needs opencode binary)
+
+showcase:
+  has_ui: true
+  showable: ["dashboard overview", "requests screen", "endpoints screen", "SSH tunnel screen"]
+  assets_dir: docs/assets
+  assets: [Dashboard.png, ModelCalls.png, ServerEndpoints.png]   # 1904x756, 1088x579, 1095x407; 331 KiB total
+  demo_url: null
+  pages_url: null
+  personal_site_url: null
+  personal_site_has_page: false
+  video_url: null
+  asset_source: user-supplied  # captured by the author, anonymised endpoint names
+
+docs:
+  surface: docs-dir
+  file_count: 11
+  governing_rules:
+    - CLAUDE.md
+  historical_dirs:
+    - docs/plans                # design docs marked "Status: implemented";
+                                # they describe the repo as it was. Do not sweep renames through these.
+
+ml:
+  reports_metrics: false
+
+constraints:
+  do_not_publish: [".env", "web/backend/data/", "web/backend/logs/"]
+  do_not_move:
+    - scripts/relay-serve.sh    # deploy/systemd/relay.service ExecStarts this path
+    - scripts/opencode-serve.sh # deploy/systemd/opencode.service ExecStarts this path
+  history_rewrite_allowed: false
