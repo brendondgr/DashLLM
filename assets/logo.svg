@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256"
+     role="img" aria-label="Relay: a letter R whose stem is a cyan arrow pointing up beside an amber arrow pointing down">
+  <!-- The Relay mark. The R's stem is the proxy: a request going one way and
+       tokens coming back the other. The two colours are the dashboard's own —
+       cyan is tokens in, amber is tokens out — so the mark and the charts agree.
+       Edit here only. tools/make_header.py copies these paths into
+       assets/header.svg, and App.tsx inlines the same geometry for the sidebar. -->
+  <rect x="2" y="2" width="252" height="252" rx="56" fill="#11151D" stroke="#2A3547" stroke-width="4"/>
+  <g transform="translate(-6,0)" fill="none" stroke-width="15" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M118 66h36a30 30 0 0 1 0 60h-36" stroke="#E6EAF2"/>
+    <path d="M132 126l44 64" stroke="#E6EAF2"/>
+    <g stroke="#58C4DD"><path d="M94 190V66"/><path d="M83 77l11-11 11 11"/></g>
+    <g stroke="#FFB224"><path d="M118 66v124"/><path d="M107 179l11 11 11-11"/></g>
+  </g>
+</svg>

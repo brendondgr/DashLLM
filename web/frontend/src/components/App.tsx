@@ -90,11 +90,11 @@ export default function App() {
           display: 'flex', alignItems: 'center', gap: 10,
           padding: '16px 16px 14px', borderBottom: `1px solid ${C.border}`,
         }}>
-          <div style={{
-            width: 26, height: 26, flex: 'none', borderRadius: 6,
-            background: ACCENT, display: 'grid', placeItems: 'center',
-            color: C.bg, font: `700 13px ${MONO}`,
-          }}>⇄</div>
+          {/* One drawing, three places: assets/logo.svg is the original,
+              tools/make_header.py copies it to public/logo.svg for this mark
+              and the favicon, and embeds it in the README banner. */}
+          <img src="/logo.svg" width={26} height={26} alt=""
+               style={{ flex: 'none', display: 'block' }} />
           <div style={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
             <span style={{ font: `700 14px ${MONO}`, letterSpacing: '.02em' }}>relay</span>
             <span style={{ font: `400 10px ${SANS}`, color: C.textMut }}>LLM proxy · v0.4.2</span>

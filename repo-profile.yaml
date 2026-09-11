@@ -5,6 +5,7 @@ repo:
   archetype: web-app
   secondary: service
   one_liner: "An OpenAI-compatible proxy that routes local and agent model servers behind one URL and records what every request cost in latency and tokens."
+  display_name: "Relay: LLM Dashboard"   # what the banner and README show; the GitHub repo is still DashLLM
   status: active
   status_honest_note: "Built from 2026-07-03, in daily self-hosted use. 42 commits; last 2026-09-07."
   visibility: private          # ← blocker for purpose: portfolio
@@ -33,6 +34,9 @@ showcase:
   showable: ["dashboard overview", "requests screen", "endpoints screen", "SSH tunnel screen"]
   assets_dir: docs/assets
   assets: [Dashboard.png, ModelCalls.png, ServerEndpoints.png]   # 1904x756, 1088x579, 1095x407; 331 KiB total
+  logo: assets/logo.svg              # the one original; generated copies are assets/header.svg
+                                     # and web/frontend/public/logo.svg, both from tools/make_header.py
+  banner: assets/header.svg          # regenerate with: python3 tools/make_header.py
   demo_url: null
   pages_url: null
   personal_site_url: null

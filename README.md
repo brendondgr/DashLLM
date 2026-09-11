@@ -1,4 +1,10 @@
-# DashLLM (relay)
+<p align="center">
+  <img src="assets/header.svg" width="880"
+       alt="Relay: LLM Dashboard. The mark is a letter R whose stem is a cyan arrow pointing up beside an amber arrow pointing down. One OpenAI-compatible /v1 in front of local model servers and agent servers, and a record of what every request through it cost in latency and tokens. Written in Python, TypeScript and Shell, on FastAPI, Astro, React, ECharts, SQLite and uv." />
+</p>
+
+<!-- The banner repeats the sentence below. Change one, change both, then run
+     python3 tools/make_header.py -->
 
 An OpenAI-compatible **LLM proxy** with a telemetry **dashboard**. relay sits
 between your clients and one or more model servers (llama.cpp, vLLM, ollama,
